@@ -1,0 +1,10 @@
+# data files — never push to GitHub
+sample/
+dataloader/all_stays/
+*.csv
+*.ipynb
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo

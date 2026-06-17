@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MIMIC-IV Sample — Schema</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: #0d1117;
+  color: #c9d1d9;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  padding: 32px 40px;
+  min-width: 1360px;
+}
+
+h1 { font-size: 1.4rem; font-weight: 700; color: #f0f6fc; margin-bottom: 4px; }
+.sub { font-size: 0.82rem; color: #8b949e; margin-bottom: 22px; }
+
+.legend {
+  display: flex; align-items: center; gap: 28px;
+  font-size: 0.75rem; color: #8b949e; margin-bottom: 20px;
+}
+.leg-item { display: flex; align-items: center; gap: 8px; }
+.leg-line { width: 26px; height: 2px; border-radius: 1px; }
+
+/* ── Diagram ── */
+#wrap {
+  position: relative;
+  width: 1280px;
+  height: 1100px;
+}
+
+#svg-lines {
+  position: absolute; top: 0; left: 0;
+  width: 100%; height: 100%;
+  pointer-events: none; z-index: 1;
+}
+
+/* Table cards */
+.tbl {
+  position: absolute;
+  background: #161b22;
+  border-radius: 8px;
+  overflow: hidden;
+  z-index: 2;
+  box-shadow: 0 0 0 1px #30363d, 0 4px 18px rgba(0,0,0,0.5);
+  transition: box-shadow 0.15s;
+}
+.tbl:hover { box-shadow: 0 0 0 1px #58a6ff, 0 6px 24px rgba(88,166,255,0.15); }
+
+.tbl-head {
+  padding: 9px 14px;
+  font-size: 0.71rem; font-weight: 700;
+  letter-spacing: 0.07em; text-transform: uppercase;
+  display: flex; align-items: center; gap: 7px; color: #fff;
+}
+
+.tbl-body { padding: 4px 0 8px; }
+
+.col {
+  display: flex; align-items: center;
+  padding: 2.5px 14px; font-size: 0.71rem; gap: 6px;
+}
+
+.col-name {
+  flex: 1;
+  font-family: 'Cascadia Code', Consolas, monospace;
+  color: #c9d1d9;
+}
+.col-name.pk { color: #ffa657; font-weight: 600; }
+.col-name.fk { color: #79c0ff; }
+
+.badge {
+  font-size: 0.58rem; font-weight: 700;
+  padding: 1px 5px; border-radius: 4px;
+  letter-spacing: 0.05em; flex-shrink: 0;
+}
+.badge.pk { background: #3d2b00; color: #ffa657; border: 1px solid #6e3a00; }
+.badge.fk { background: #0d2744; color: #79c0ff;  border: 1px solid #1a4060; }
+
+.sep { height: 1px; background: #21262d; margin: 3px 0; }
+
+/* ── Most Important section ── */
+.section-h {
+  font-size: 1.05rem; font-weight: 700; color: #f0f6fc;
+  margin: 52px 0 18px;
+  display: flex; align-items: center; gap: 10px;
+}
+.section-h::before {
+  content: ''; display: inline-block;
+  width: 3px; height: 1.1em;
+  background: #6366f1; border-radius: 2px;
+}
+
+.cards { display: grid; grid-template-columns: repeat(3, 400px); gap: 14px; }
+
+.card {
+  background: #161b22;
+  border-radius: 8px;
+  box-shadow: 0 0 0 1px #30363d;
+  padding: 16px 18px;
+}
+.card-rank  { font-size: 0.65rem; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 5px; }
+.card-file  { font-family: Consolas, monospace; font-size: 0.84rem; font-weight: 700; margin-bottom: 10px; }
+.card-body  { font-size: 0.76rem; color: #8b949e; line-height: 1.65; }
+.card-body b { color: #c9d1d9; }
+.tag {
+  display: inline-block; font-size: 0.64rem;
+  padding: 2px 8px; border-radius: 20px;
+  font-weight: 600; margin-top: 10px;
+}
+
+.others { margin-top: 22px; font-size: 0.78rem; color: #8b949e; line-height: 1.7; }
+.others b { color: #c9d1d9; }
+</style>
+</head>
+<body>
+
+<h1>MIMIC-IV Sample Dataset — Schema &amp; Relationships</h1>
+<p class="sub">7 files &nbsp;·&nbsp; 1,000 linked ICU patients &nbsp;·&nbsp; Beth Israel Deaconess Medical Center &nbsp;·&nbsp; 2008–2019</p>
+
+<div class="legend">
+  <span>Key joins:</span>
+  <div class="leg-item"><div class="leg-line" style="background:#a78bfa"></div><span>subject_id — patient spine (present in every table)</span></div>
+  <div class="leg-item"><div class="leg-line" style="background:#38bdf8"></div><span>hadm_id — hospital admission spine</span></div>
+  <div class="leg-item"><div class="leg-line" style="background:#34d399"></div><span>stay_id — ICU stay spine</span></div>
+</div>
+
+<!-- ══════════════════════ DIAGRAM ══════════════════════ -->
+<div id="wrap">
+  <svg id="svg-lines"></svg>
+
+  <!-- patients -->
+  <div class="tbl" id="t-patients" style="left:524px; top:20px; width:232px;">
+    <div class="tbl-head" style="background:#1a2230;">👤 &nbsp;patients.csv</div>
+    <div class="tbl-body">
+      <div class="col"><span class="col-name pk">subject_id</span><span class="badge pk">PK</span></div>
+      <div class="sep"></div>
+      <div class="col"><span class="col-name">gender</span></div>
+      <div class="col"><span class="col-name">anchor_age</span></div>
+      <div class="col"><span class="col-name">anchor_year_group</span></div>
+      <div class="col"><span class="col-name">dod</span></div>
+    </div>
+  </div>
+
+  <!-- admissions -->
+  <div class="tbl" id="t-admissions" style="left:340px; top:240px; width:270px;">
+    <div class="tbl-head" style="background:#1a2820;">🏥 &nbsp;admissions.csv</div>
+    <div class="tbl-body">
+      <div class="col"><span class="col-name pk">hadm_id</span><span class="badge pk">PK</span></div>
+      <div class="col"><span class="col-name fk">subject_id</span><span class="badge fk">FK</span></div>
+      <div class="sep"></div>
+      <div class="col"><span class="col-name">admittime</span></div>
+      <div class="col"><span class="col-name">dischtime</span></div>
+      <div class="col"><span class="col-name">admission_type</span></div>
+      <div class="col"><span class="col-name">insurance</span></div>
+      <div class="col"><span class="col-name">race</span></div>
+      <div class="col"><span class="col-name">hospital_expire_flag</span></div>
+      <div class="col"><span class="col-name">los_days</span></div>
+    </div>
+  </div>
+
+  <!-- labevents -->
+  <div class="tbl" id="t-labevents" style="left:1000px; top:240px; width:258px;">
+    <div class="tbl-head" style="background:#1a1f2e;">🧪 &nbsp;labevents_sample.csv</div>
+    <div class="tbl-body">
+      <div class="col"><span class="col-name pk">labevent_id</span><span class="badge pk">PK</span></div>
+      <div class="col"><span class="col-name fk">subject_id</span><span class="badge fk">FK</span></div>
+      <div class="col"><span class="col-name fk">hadm_id</span><span class="badge fk">FK</span></div>
+      <div class="sep"></div>
+      <div class="col"><span class="col-name">charttime</span></div>
+      <div class="col"><span class="col-name">itemid</span></div>
+      <div class="col"><span class="col-name">label</span></div>
+      <div class="col"><span class="col-name">valuenum</span></div>
+      <div class="col"><span class="col-name">valueuom</span></div>
+      <div class="col"><span class="col-name">ref_range_lower</span></div>
+      <div class="col"><span class="col-name">ref_range_upper</span></div>
+      <div class="col"><span class="col-name">flag</span></div>
+      <div class="col"><span class="col-name">priority</span></div>
+    </div>
+  </div>
+
+  <!-- icustays -->
+  <div class="tbl" id="t-icustays" style="left:80px; top:550px; width:244px;">
+    <div class="tbl-head" style="background:#28181a;">🛏 &nbsp;icustays.csv</div>
+    <div class="tbl-body">
+      <div class="col"><span class="col-name pk">stay_id</span><span class="badge pk">PK</span></div>
+      <div class="col"><span class="col-name fk">hadm_id</span><span class="badge fk">FK</span></div>
+      <div class="col"><span class="col-name fk">subject_id</span><span class="badge fk">FK</span></div>
+      <div class="sep"></div>
+      <div class="col"><span class="col-name">first_careunit</span></div>
+      <div class="col"><span class="col-name">last_careunit</span></div>
+      <div class="col"><span class="col-name">intime</span></div>
+      <div class="col"><span class="col-name">outtime</span></div>
+      <div class="col"><span class="col-name">icu_los_days</span></div>
+    </div>
+  </div>
+
+  <!-- diagnoses -->
+  <div class="tbl" id="t-diagnoses" style="left:720px; top:550px; width:240px;">
+    <div class="tbl-head" style="background:#1e1a28;">📋 &nbsp;diagnoses.csv</div>
+    <div class="tbl-body">
+      <div class="col"><span class="col-name fk">subject_id</span><span class="badge fk">FK</span></div>
+      <div class="col"><span class="col-name fk">hadm_id</span><span class="badge fk">FK</span></div>
+      <div class="sep"></div>
+      <div class="col"><span class="col-name">seq_num</span></div>
+      <div class="col"><span class="col-name">icd_code</span></div>
+      <div class="col"><span class="col-name">icd_version</span></div>
+      <div class="col"><span class="col-name">long_title</span></div>
+    </div>
+  </div>
+
+  <!-- chartevents_vitals -->
+  <div class="tbl" id="t-chart-vitals" style="left:20px; top:840px; width:248px;">
+    <div class="tbl-head" style="background:#182020;">💓 &nbsp;chartevents_vitals.csv</div>
+    <div class="tbl-body">
+      <div class="col"><span class="col-name fk">subject_id</span><span class="badge fk">FK</span></div>
+      <div class="col"><span class="col-name fk">hadm_id</span><span class="badge fk">FK</span></div>
+      <div class="col"><span class="col-name fk">stay_id</span><span class="badge fk">FK</span></div>
+      <div class="sep"></div>
+      <div class="col"><span class="col-name">charttime</span></div>
+      <div class="col"><span class="col-name">itemid</span></div>
+      <div class="col"><span class="col-name">vital_name</span></div>
+      <div class="col"><span class="col-name">valuenum</span></div>
+      <div class="col"><span class="col-name">valueuom</span></div>
+      <div class="col"><span class="col-name">warning</span></div>
+    </div>
+  </div>
+
+  <!-- chartevents_100k -->
+  <div class="tbl" id="t-chart-100k" style="left:294px; top:840px; width:258px;">
+    <div class="tbl-head" style="background:#182020;">📊 &nbsp;chartevents_100k.csv</div>
+    <div class="tbl-body">
+      <div class="col"><span class="col-name fk">subject_id</span><span class="badge fk">FK</span></div>
+      <div class="col"><span class="col-name fk">hadm_id</span><span class="badge fk">FK</span></div>
+      <div class="col"><span class="col-name fk">stay_id</span><span class="badge fk">FK</span></div>
+      <div class="sep"></div>
+      <div class="col"><span class="col-name">charttime / storetime</span></div>
+      <div class="col"><span class="col-name">caregiver_id</span></div>
+      <div class="col"><span class="col-name">itemid</span></div>
+      <div class="col"><span class="col-name">label</span></div>
+      <div class="col"><span class="col-name">category</span></div>
+      <div class="col"><span class="col-name">valuenum / valueuom</span></div>
+      <div class="col"><span class="col-name">warning</span></div>
+    </div>
+  </div>
+
+</div><!-- #wrap -->
+
+<!-- ══════════════════════ MOST IMPORTANT ══════════════════════ -->
+<div class="section-h">Most Important Files</div>
+
+<div class="cards">
+
+  <div class="card">
+    <div class="card-rank" style="color:#ffa657;">★ Rank 1 — Pre-training signal</div>
+    <div class="card-file" style="color:#ffa657;">chartevents (vitals + 100k)</div>
+    <div class="card-body">
+      The <b>raw time-series</b> that a foundation model trains on.
+      Every row is one measurement at one moment — heart rate, BP, SpO₂, temperature
+      charted roughly every hour per patient.
+      In the full dataset: <b>433 million rows</b> across 94k ICU stays.
+      <br><br>
+      This is what you <b>tokenise, mask, and predict</b> during pre-training.
+      Without it there is no foundation model.
+    </div>
+    <span class="tag" style="background:#3d2b00; color:#ffa657;">433M rows in full file</span>
+  </div>
+
+  <div class="card">
+    <div class="card-rank" style="color:#34d399;">★ Rank 2 — Outcome labels</div>
+    <div class="card-file" style="color:#34d399;">admissions.csv</div>
+    <div class="card-body">
+      Contains every downstream evaluation label:
+      <b>hospital_expire_flag</b> (in-hospital mortality),
+      <b>los_days</b> (length of stay),
+      <b>discharge_location</b> (home vs SNF vs died),
+      <b>admission_type</b> (elective vs emergency).
+      <br><br>
+      Also holds <b>race, insurance, language</b> — essential for
+      fairness audits, which reviewers now require for clinical AI papers.
+    </div>
+    <span class="tag" style="background:#0d2a1f; color:#34d399;">The label table for every task</span>
+  </div>
+
+  <div class="card">
+    <div class="card-rank" style="color:#38bdf8;">★ Rank 3 — Complementary signal</div>
+    <div class="card-file" style="color:#38bdf8;">labevents_sample.csv</div>
+    <div class="card-body">
+      Lab results (creatinine, glucose, WBC, hemoglobin…) are <b>less frequent</b>
+      than vitals — roughly once per day — but <b>more clinically decisive</b>.
+      Sepsis, AKI, and organ failure are detected through labs first.
+      <br><br>
+      For <b>multicentre work</b>: lab tests are far more standardised
+      across hospitals than charted vitals, making them better
+      generalisation anchors when training across sites.
+    </div>
+    <span class="tag" style="background:#0d2233; color:#38bdf8;">Best signal for cross-site transfer</span>
+  </div>
+
+</div>
+
+<div class="others">
+  <br>
+  <b>icustays.csv</b> — needed to link stay_id → hadm_id and to compute ICU LOS (a key target variable). &nbsp;·&nbsp;
+  <b>diagnoses.csv</b> — provides ICD codes for cohort selection (e.g. "all sepsis patients") and label stratification. &nbsp;·&nbsp;
+  <b>patients.csv</b> — demographics; small but required to compute patient age and join everything to a person. &nbsp;
+  <br><br>
+  For the GPT-MEDIC PhD specifically: the core data pipeline is
+  <b>chartevents + labevents → tokenised event stream per patient</b>,
+  with <b>admissions.hospital_expire_flag</b> as the primary evaluation label.
+</div>
+
+<!-- ══════════════════════ JS: DRAW LINES ══════════════════════ -->
+<script>
+const connections = [
+  { from: 't-patients',   to: 't-admissions',   label: 'subject_id', color: '#a78bfa' },
+  { from: 't-patients',   to: 't-labevents',    label: 'subject_id', color: '#a78bfa' },
+  { from: 't-admissions', to: 't-icustays',     label: 'hadm_id',    color: '#38bdf8' },
+  { from: 't-admissions', to: 't-diagnoses',    label: 'hadm_id',    color: '#38bdf8' },
+  { from: 't-admissions', to: 't-labevents',    label: 'hadm_id',    color: '#38bdf8' },
+  { from: 't-icustays',   to: 't-chart-vitals', label: 'stay_id',    color: '#34d399' },
+  { from: 't-icustays',   to: 't-chart-100k',   label: 'stay_id',    color: '#34d399' },
+];
+
+function getBox(id) {
+  const el  = document.getElementById(id);
+  const wr  = document.getElementById('wrap');
+  const er  = el.getBoundingClientRect();
+  const wrr = wr.getBoundingClientRect();
+  const l = er.left - wrr.left, t = er.top - wrr.top;
+  return { l, t, r: l + er.width, b: t + er.height,
+           cx: l + er.width / 2, cy: t + er.height / 2 };
+}
+
+function exitPt(b, dir) {
+  return dir === 'top'    ? [b.cx, b.t]  :
+         dir === 'bottom' ? [b.cx, b.b]  :
+         dir === 'left'   ? [b.l,  b.cy] : [b.r, b.cy];
+}
+
+function bestDirs(a, b) {
+  const dy = b.cy - a.cy, dx = b.cx - a.cx;
+  if (Math.abs(dy) > Math.abs(dx) * 0.55)
+    return dy > 0 ? ['bottom','top'] : ['top','bottom'];
+  return dx > 0 ? ['right','left'] : ['left','right'];
+}
+
+function draw() {
+  const ns   = 'http://www.w3.org/2000/svg';
+  const svg  = document.getElementById('svg-lines');
+  const wrap = document.getElementById('wrap');
+  svg.setAttribute('viewBox', `0 0 ${wrap.offsetWidth} ${wrap.offsetHeight}`);
+
+  /* arrow markers */
+  const defs = document.createElementNS(ns, 'defs');
+  ['a78bfa','38bdf8','34d399'].forEach(hex => {
+    const m = document.createElementNS(ns, 'marker');
+    m.setAttribute('id', 'arr' + hex);
+    m.setAttribute('viewBox', '0 0 8 8');
+    m.setAttribute('refX', '7'); m.setAttribute('refY', '4');
+    m.setAttribute('markerWidth', '5'); m.setAttribute('markerHeight', '5');
+    m.setAttribute('orient', 'auto');
+    const p = document.createElementNS(ns, 'path');
+    p.setAttribute('d', 'M0,0 L8,4 L0,8 Z');
+    p.setAttribute('fill', '#' + hex);
+    m.appendChild(p); defs.appendChild(m);
+  });
+  svg.appendChild(defs);
+
+  connections.forEach(c => {
+    const A = getBox(c.from), B = getBox(c.to);
+    const [dA, dB] = bestDirs(A, B);
+    const [x1, y1] = exitPt(A, dA);
+    const [x2, y2] = exitPt(B, dB);
+
+    const bend = Math.max(Math.abs(x2 - x1), Math.abs(y2 - y1)) * 0.45;
+    let cx1 = x1, cy1 = y1, cx2 = x2, cy2 = y2;
+    if      (dA === 'bottom') cy1 += bend;
+    else if (dA === 'top')    cy1 -= bend;
+    else if (dA === 'right')  cx1 += bend;
+    else                      cx1 -= bend;
+    if      (dB === 'top')    cy2 -= bend;
+    else if (dB === 'bottom') cy2 += bend;
+    else if (dB === 'left')   cx2 -= bend;
+    else                      cx2 += bend;
+
+    const hex = c.color.slice(1);
+
+    /* curve */
+    const path = document.createElementNS(ns, 'path');
+    path.setAttribute('d', `M${x1},${y1} C${cx1},${cy1} ${cx2},${cy2} ${x2},${y2}`);
+    path.setAttribute('fill', 'none');
+    path.setAttribute('stroke', c.color);
+    path.setAttribute('stroke-width', '1.8');
+    path.setAttribute('opacity', '0.72');
+    path.setAttribute('marker-end', `url(#arr${hex})`);
+    svg.appendChild(path);
+
+    /* label */
+    const mx = (x1 + x2) / 2 + (cx1 + cx2) / 2;
+    const my = (y1 + y2) / 2 + (cy1 + cy2) / 2;
+    const lbl = document.createElementNS(ns, 'text');
+    lbl.setAttribute('x', mx / 2); lbl.setAttribute('y', my / 2 + 4);
+    lbl.setAttribute('text-anchor', 'middle');
+    lbl.setAttribute('fill', c.color);
+    lbl.setAttribute('font-size', '10');
+    lbl.setAttribute('font-family', 'Consolas, monospace');
+    lbl.textContent = c.label;
+    svg.appendChild(lbl);
+
+    const bb = lbl.getBBox();
+    const bg = document.createElementNS(ns, 'rect');
+    bg.setAttribute('x', bb.x - 3);  bg.setAttribute('y', bb.y - 2);
+    bg.setAttribute('width', bb.width + 6); bg.setAttribute('height', bb.height + 4);
+    bg.setAttribute('fill', '#0d1117'); bg.setAttribute('rx', '3');
+    svg.insertBefore(bg, lbl);
+  });
+}
+
+window.addEventListener('load', draw);
+</script>
+</body>
+</html>
