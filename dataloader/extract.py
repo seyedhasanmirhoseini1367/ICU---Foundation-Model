@@ -8,13 +8,13 @@ Columns: delta_hours, time, source, itemid, label, value, unit
 
 Output:
     dataloader/
-        index.csv               — one row per stay with labels
+        index.csv               -- one row per stay with labels
         all_stays/
             {subject_id}_{stay_id}.csv
 
 Usage:
     # All patients (Kaggle / full run):
-    python dataloader/extract.py --root /kaggle/input/icu-datasets
+    python dataloader/extract.py --root /kaggle/input/datasets/luciadam/icu-datasets
 
     # Quick smoke-test with 50 patients:
     python dataloader/extract.py --root /path/to/mimic --n 50
@@ -24,6 +24,7 @@ Usage:
 """
 
 import argparse
+import gc
 import os
 import sys
 from pathlib import Path
@@ -37,8 +38,11 @@ except ImportError:
     def tqdm(x, **kwargs):
         return x
 
+# Patients per memory batch. 1000 uses ~1-2 GB peak, well within Kaggle limits.
+BATCH_SIZE = 1000
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+
+# -- CLI -----------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -61,7 +65,7 @@ def parse_args():
     return p.parse_args()
 
 
-# ── Path helpers ──────────────────────────────────────────────────────────────
+# -- Path helpers --------------------------------------------------------------
 
 def find_mimic_root(base: str) -> Path:
     """Walk from base until we find a directory that has both icu/ and hosp/."""
@@ -79,7 +83,7 @@ def p(path: Path) -> str:
     return str(path).replace("\\", "/")
 
 
-# ── DuckDB queries ────────────────────────────────────────────────────────────
+# -- DuckDB queries ------------------------------------------------------------
 
 def load_stays(con, icu: Path, n_patients: int) -> pd.DataFrame:
     limit_clause = f"LIMIT {n_patients}" if n_patients > 0 else ""
@@ -112,9 +116,8 @@ def load_labels(con, hosp: Path, sid_str: str) -> pd.DataFrame:
     """).df()
 
 
-def load_events(con, icu: Path, hosp: Path, sid_str: str) -> tuple:
-    """Load all 4 event tables for the selected subjects in one pass each."""
-    print("  chartevents …", flush=True)
+def load_events_batch(con, icu: Path, hosp: Path, sid_str: str) -> tuple:
+    """Load all 4 event tables for a batch of subjects."""
     chart = con.execute(f"""
         SELECT c.subject_id, c.stay_id,
                c.charttime AS time, 'CHART' AS source,
@@ -124,9 +127,7 @@ def load_events(con, icu: Path, hosp: Path, sid_str: str) -> tuple:
         WHERE c.subject_id IN ({sid_str})
           AND c.valuenum IS NOT NULL AND c.warning = 0
     """).df()
-    print(f"    {len(chart):,} rows")
 
-    print("  inputevents …", flush=True)
     inp = con.execute(f"""
         SELECT i.subject_id, i.stay_id,
                i.starttime AS time, 'INPUT' AS source,
@@ -136,9 +137,7 @@ def load_events(con, icu: Path, hosp: Path, sid_str: str) -> tuple:
         WHERE i.subject_id IN ({sid_str})
           AND i.statusdescription != 'Rewritten'
     """).df()
-    print(f"    {len(inp):,} rows")
 
-    print("  outputevents …", flush=True)
     out = con.execute(f"""
         SELECT o.subject_id, o.stay_id,
                o.charttime AS time, 'OUTPUT' AS source,
@@ -147,9 +146,7 @@ def load_events(con, icu: Path, hosp: Path, sid_str: str) -> tuple:
         JOIN read_csv_auto('{p(icu)}/d_items.csv') d ON o.itemid = d.itemid
         WHERE o.subject_id IN ({sid_str})
     """).df()
-    print(f"    {len(out):,} rows")
 
-    print("  labevents …", flush=True)
     lab = con.execute(f"""
         SELECT l.subject_id, l.hadm_id,
                l.charttime AS time, 'LAB' AS source,
@@ -159,12 +156,11 @@ def load_events(con, icu: Path, hosp: Path, sid_str: str) -> tuple:
         WHERE l.subject_id IN ({sid_str})
           AND l.valuenum IS NOT NULL
     """).df()
-    print(f"    {len(lab):,} rows")
 
     return chart, inp, out, lab
 
 
-# ── Per-stay assembly ─────────────────────────────────────────────────────────
+# -- Per-stay assembly ---------------------------------------------------------
 
 def build_stay_timeline(
     stay: pd.Series,
@@ -197,12 +193,11 @@ def build_stay_timeline(
             [["delta_hours", "time", "source", "itemid", "label", "value", "unit"]])
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# -- Entry point ---------------------------------------------------------------
 
 def main():
     args = parse_args()
 
-    # Resolve MIMIC root (handles nested structures like iv/content/mimic-iv-3.1/)
     mimic_root = find_mimic_root(args.root)
     icu  = mimic_root / "icu"
     hosp = mimic_root / "hosp"
@@ -210,49 +205,100 @@ def main():
     print(f"ICU tables : {icu}")
     print(f"HOSP tables: {hosp}")
 
-    # Output paths — default to repo-relative locations
     repo_root = Path(__file__).resolve().parent.parent
     out_dir   = Path(args.out)   if args.out   else repo_root / "dataloader" / "all_stays"
     idx_path  = Path(args.index) if args.index else repo_root / "dataloader" / "index.csv"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     n_label = f"{args.n} patients" if args.n > 0 else "ALL patients"
-    print(f"Extracting : {n_label}  →  {out_dir}\n")
+    print(f"Extracting : {n_label}  ->  {out_dir}\n")
 
     con = duckdb.connect()
+    con.execute("PRAGMA memory_limit='4GB'")
+    con.execute("PRAGMA threads=4")
 
-    # ── Load stays ────────────────────────────────────────────────────────────
-    print("Loading ICU stays …", flush=True)
+    # -- Load stays (small, fine in memory) ------------------------------------
+    print("Loading ICU stays ...", flush=True)
     stays   = load_stays(con, icu, args.n)
     n_stays = len(stays)
     print(f"  {n_stays} stays across {stays['subject_id'].nunique()} patients\n")
 
-    sid_str = ",".join(map(str, stays["subject_id"].unique().tolist()))
+    all_subjects = stays["subject_id"].unique().tolist()
+    sid_str_all  = ",".join(map(str, all_subjects))
 
-    # ── Load labels once ──────────────────────────────────────────────────────
-    print("Loading labels …", flush=True)
-    labels = load_labels(con, hosp, sid_str)
+    # -- Load labels once (small) ----------------------------------------------
+    print("Loading labels ...", flush=True)
+    labels = load_labels(con, hosp, sid_str_all)
     print(f"  {len(labels)} admissions\n")
 
-    # ── Load all 4 event tables once (memory-efficient bulk load) ─────────────
-    print("Loading event tables (this takes a few minutes) …")
-    chart, inp, out_ev, lab = load_events(con, icu, hosp, sid_str)
-    print()
+    # -- Batch loop: BATCH_SIZE patients at a time ----------------------------
+    batches   = [all_subjects[i:i+BATCH_SIZE]
+                 for i in range(0, len(all_subjects), BATCH_SIZE)]
+    n_batches = len(batches)
 
-    # ── Build one CSV per stay ────────────────────────────────────────────────
     index_rows = []
     skipped    = 0
+    extracted  = 0
 
-    for _, stay in tqdm(stays.iterrows(), total=n_stays, desc="Extracting stays"):
-        subject_id = int(stay["subject_id"])
-        stay_id    = int(stay["stay_id"])
-        hadm_id    = int(stay["hadm_id"])
-        fname      = f"{subject_id}_{stay_id}.csv"
-        fpath      = out_dir / fname
+    for batch_idx, batch_subjects in enumerate(batches):
+        batch_set     = set(batch_subjects)
+        sid_str_batch = ",".join(map(str, batch_subjects))
+        batch_stays   = stays[stays["subject_id"].isin(batch_set)]
 
-        # Skip stays already on disk (allows resuming interrupted runs)
-        if fpath.exists():
+        print(f"\nBatch {batch_idx+1}/{n_batches}  "
+              f"({len(batch_subjects)} patients, {len(batch_stays)} stays) ...",
+              flush=True)
+        print("  Loading events ...", flush=True)
+
+        chart, inp, out_ev, lab = load_events_batch(con, icu, hosp, sid_str_batch)
+        print(f"  chart={len(chart):,}  inp={len(inp):,}  "
+              f"out={len(out_ev):,}  lab={len(lab):,}", flush=True)
+
+        for _, stay in tqdm(batch_stays.iterrows(),
+                            total=len(batch_stays),
+                            desc=f"  Batch {batch_idx+1}",
+                            leave=False):
+            subject_id = int(stay["subject_id"])
+            stay_id    = int(stay["stay_id"])
+            hadm_id    = int(stay["hadm_id"])
+            fname      = f"{subject_id}_{stay_id}.csv"
+            fpath      = out_dir / fname
+
             lbl = labels[labels["hadm_id"] == hadm_id]
+
+            # Resumable: skip stays already on disk
+            if fpath.exists():
+                index_rows.append({
+                    "subject_id"           : subject_id,
+                    "stay_id"              : stay_id,
+                    "hadm_id"              : hadm_id,
+                    "intime"               : stay["intime"],
+                    "los"                  : stay["los"],
+                    "first_careunit"       : stay["first_careunit"],
+                    "age"                  : int(lbl["age"].iloc[0])    if len(lbl) else -1,
+                    "gender"               : lbl["gender"].iloc[0]      if len(lbl) else "",
+                    "admission_type"       : lbl["admission_type"].iloc[0] if len(lbl) else "",
+                    "hospital_expire_flag" : int(lbl["hospital_expire_flag"].iloc[0]) if len(lbl) else -1,
+                    "discharge_location"   : lbl["discharge_location"].iloc[0] if len(lbl) else "",
+                    "n_events"             : sum(1 for _ in open(fpath)) - 1,
+                    "file_path"            : fname,
+                })
+                continue
+
+            try:
+                timeline = build_stay_timeline(stay, chart, inp, out_ev, lab)
+            except Exception as e:
+                tqdm.write(f"  stay {stay_id}: {e}")
+                skipped += 1
+                continue
+
+            if timeline.empty:
+                skipped += 1
+                continue
+
+            timeline.to_csv(fpath, index=False)
+            extracted += 1
+
             index_rows.append({
                 "subject_id"           : subject_id,
                 "stay_id"              : stay_id,
@@ -265,57 +311,29 @@ def main():
                 "admission_type"       : lbl["admission_type"].iloc[0] if len(lbl) else "",
                 "hospital_expire_flag" : int(lbl["hospital_expire_flag"].iloc[0]) if len(lbl) else -1,
                 "discharge_location"   : lbl["discharge_location"].iloc[0] if len(lbl) else "",
-                "n_events"             : sum(1 for _ in open(fpath)) - 1,
+                "n_events"             : len(timeline),
                 "file_path"            : fname,
             })
-            continue
 
-        try:
-            timeline = build_stay_timeline(stay, chart, inp, out_ev, lab)
-        except Exception as e:
-            tqdm.write(f"  ✗ stay {stay_id}: {e}")
-            skipped += 1
-            continue
+        # Free batch memory before loading the next batch
+        del chart, inp, out_ev, lab
+        gc.collect()
 
-        if timeline.empty:
-            skipped += 1
-            continue
+        # Checkpoint index after each batch (crash-safe)
+        pd.DataFrame(index_rows).to_csv(idx_path, index=False)
+        print(f"  Checkpoint: {extracted} extracted, {skipped} skipped so far")
 
-        timeline.to_csv(fpath, index=False)
-
-        lbl             = labels[labels["hadm_id"] == hadm_id]
-        expire_flag     = int(lbl["hospital_expire_flag"].iloc[0]) if len(lbl) else -1
-        age             = int(lbl["age"].iloc[0])             if len(lbl) else -1
-        gender          = lbl["gender"].iloc[0]               if len(lbl) else ""
-        admission_type  = lbl["admission_type"].iloc[0]       if len(lbl) else ""
-        discharge_loc   = lbl["discharge_location"].iloc[0]   if len(lbl) else ""
-
-        index_rows.append({
-            "subject_id"           : subject_id,
-            "stay_id"              : stay_id,
-            "hadm_id"              : hadm_id,
-            "intime"               : stay["intime"],
-            "los"                  : stay["los"],
-            "first_careunit"       : stay["first_careunit"],
-            "age"                  : age,
-            "gender"               : gender,
-            "admission_type"       : admission_type,
-            "hospital_expire_flag" : expire_flag,
-            "discharge_location"   : discharge_loc,
-            "n_events"             : len(timeline),
-            "file_path"            : fname,
-        })
-
-    # ── Write index ───────────────────────────────────────────────────────────
+    # -- Final index -----------------------------------------------------------
     index = pd.DataFrame(index_rows)
     index.to_csv(idx_path, index=False)
 
     print(f"\nDone.")
-    print(f"  Stays extracted : {len(index_rows)}")
+    print(f"  Stays extracted : {extracted}")
     print(f"  Stays skipped   : {skipped}")
-    print(f"  Mortality rate  : {index['hospital_expire_flag'].sum()} / {len(index)}"
-          f" ({100*index['hospital_expire_flag'].mean():.1f}%)")
-    print(f"  Total events    : {index['n_events'].sum():,}")
+    if len(index) > 0:
+        print(f"  Mortality rate  : {index['hospital_expire_flag'].sum()} / {len(index)}"
+              f" ({100*index['hospital_expire_flag'].mean():.1f}%)")
+        print(f"  Total events    : {index['n_events'].sum():,}")
     print(f"  Index saved     : {idx_path}")
 
 
