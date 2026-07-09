@@ -40,6 +40,10 @@ if torch.cuda.is_available():
 # -- CELL 2 . wandb authentication
 # ==============================================================================
 
+# Must be set BEFORE importing wandb to avoid subprocess service startup failure
+os.environ["WANDB_START_METHOD"] = "thread"
+os.environ["WANDB_SERVICE_WAIT"] = "300"
+
 import wandb
 
 try:
@@ -47,12 +51,10 @@ try:
     _key = UserSecretsClient().get_secret("WANDB_API_KEY")
     wandb.login(key=_key, relogin=True)
     os.environ["USE_WANDB"] = "1"
-    os.environ["WANDB_START_METHOD"] = "thread"
     print("wandb   : authenticated OK")
 except Exception as e:
     os.environ["USE_WANDB"] = "0"
     print(f"wandb   : skipped ({e})")
-    print("         To enable wandb: Notebook -> Add-ons -> Secrets -> WANDB_API_KEY")
 
 # ==============================================================================
 # -- CELL 3 . Clone repo
