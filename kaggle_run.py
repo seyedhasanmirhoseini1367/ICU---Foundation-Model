@@ -1,5 +1,5 @@
 """
-kaggle_run.py — Full ICU Foundation Model pipeline for Kaggle
+kaggle_run.py - Full ICU Foundation Model pipeline for Kaggle
 
 Copy this file into a Kaggle notebook and run each cell block in order,
 OR run the whole file at once:
@@ -7,19 +7,19 @@ OR run the whole file at once:
     exec(open('/kaggle/working/kaggle_run.py').read())
 
 Prerequisites in Kaggle:
-  1. Attach dataset:  luciadam/icu-datasets  (Add data → Your datasets)
-  2. Add secret:      WANDB_API_KEY           (Notebook → Add-ons → Secrets)
-  3. Enable GPU:      Accelerator → GPU T4 x1
+  1. Attach dataset:  luciadam/icu-datasets  (Add data -> Your datasets)
+  2. Add secret:      WANDB_API_KEY           (Notebook -> Add-ons -> Secrets)
+  3. Enable GPU:      Accelerator -> GPU T4 x1
 
-Expected total runtime: ~4–6 hours on T4 GPU
+Expected total runtime: ~4-6 hours on T4 GPU
 """
 
 import os, sys, subprocess
 from pathlib import Path
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── CELL 1 · Environment ─────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# -- CELL 1 . Environment
+# ==============================================================================
 
 subprocess.run(
     [sys.executable, "-m", "pip", "install", "-q", "wandb", "duckdb", "tqdm"],
@@ -33,9 +33,9 @@ if torch.cuda.is_available():
     props = torch.cuda.get_device_properties(0)
     print(f"GPU     : {props.name}  ({props.total_memory/1e9:.1f} GB VRAM)")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── CELL 2 · wandb authentication ────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# -- CELL 2 . wandb authentication
+# ==============================================================================
 
 import wandb
 
@@ -44,14 +44,14 @@ try:
     _key = UserSecretsClient().get_secret("WANDB_API_KEY")
     wandb.login(key=_key)
     os.environ["USE_WANDB"] = "1"
-    print("wandb   : authenticated ✓")
+    print("wandb   : authenticated OK")
 except Exception as e:
     os.environ["USE_WANDB"] = "0"
     print(f"wandb   : skipped ({e})")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── CELL 3 · Clone repo ──────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# -- CELL 3 . Clone repo
+# ==============================================================================
 
 WORK = Path("/kaggle/working")
 os.chdir(WORK)
@@ -60,18 +60,18 @@ REPO_URL = "https://github.com/seyedhasanmirhoseini1367/ICU---Foundation-Model.g
 
 if (WORK / ".git").exists():
     subprocess.run(["git", "pull"], check=True)
-    print("Repo    : up to date ✓")
+    print("Repo    : up to date OK")
 else:
     subprocess.run(["git", "init"], check=True)
     subprocess.run(["git", "remote", "add", "origin", REPO_URL], check=True)
     subprocess.run(["git", "pull", "origin", "main"], check=True)
-    print("Repo    : cloned ✓")
+    print("Repo    : cloned OK")
 
 sys.path.insert(0, str(WORK))
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── CELL 4 · Inspect dataset & detect MIMIC root ─────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# -- CELL 4 . Inspect dataset & detect MIMIC root
+# ==============================================================================
 
 DATA_BASE = Path("/kaggle/input/icu-datasets")
 
@@ -81,7 +81,8 @@ for item in sorted(DATA_BASE.iterdir()):
     size = ""
     if item.is_file():
         size = f"  {item.stat().st_size/1e6:.0f} MB"
-    print(f"  {'📁' if item.is_dir() else '📄'} {item.name}{size}")
+    kind = "[DIR]" if item.is_dir() else "[FILE]"
+    print(f"  {kind} {item.name}{size}")
 
 
 def find_mimic_root(base: Path) -> Path:
@@ -106,18 +107,18 @@ _required = [
     MIMIC_ROOT / "hosp" / "patients.csv",
 ]
 for f in _required:
-    status = "✓" if f.exists() else "✗ MISSING"
+    status = "OK" if f.exists() else "MISSING"
     print(f"  {status}  {f.relative_to(DATA_BASE)}")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── CELL 5 · Extract all stays ───────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# -- CELL 5 . Extract all stays
+# ==============================================================================
 #
-# First run:  ~30–60 min  (reads chartevents.csv which is several GB)
+# First run:  ~30-60 min  (reads chartevents.csv which is several GB)
 # Resumable:  already-extracted stays are skipped automatically.
 #
 # To test with 50 patients first, add:  --n 50
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 STAYS_DIR = WORK / "dataloader" / "all_stays"
 STAYS_DIR.mkdir(parents=True, exist_ok=True)
@@ -130,25 +131,25 @@ subprocess.run([
     "--root",  str(MIMIC_ROOT),
     "--out",   str(STAYS_DIR),
     "--index", str(WORK / "dataloader" / "index.csv"),
-    # "--n", "50",      ← uncomment to test with 50 patients only
+    # "--n", "50",      <- uncomment to test with 50 patients only
 ], check=True)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── CELL 6 · Build vocabulary & normalisation stats ──────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# -- CELL 6 . Build vocabulary & normalisation stats
+# ==============================================================================
 
 subprocess.run(
     [sys.executable, str(WORK / "tokenizer" / "build_vocab.py")],
     check=True,
 )
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── CELL 7 · Pre-training (Masked Event Modeling) ────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# -- CELL 7 . Pre-training (Masked Event Modeling)
+# ==============================================================================
 #
-# ~1–2 hours on T4 for 65k stays (50-epoch budget, early stop at ~43).
+# ~1-2 hours on T4 for 65k stays (50-epoch budget, early stop at ~43).
 # Watch live at:  https://wandb.ai/seyedhasan-mirhoseini1367-tampere-university/MIMIC-IV-ICU
-# ─────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 
 subprocess.run(
     [sys.executable, str(WORK / "training" / "pretrain.py")],
@@ -156,12 +157,12 @@ subprocess.run(
     check=True,
 )
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── CELL 8 · Fine-tuning (mortality + LOS) ───────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# -- CELL 8 . Fine-tuning (mortality + LOS)
+# ==============================================================================
 #
-# ~45–90 min on T4.  Best checkpoint → checkpoints/finetune/best.pt
-# ─────────────────────────────────────────────────────────────────────────────
+# ~45-90 min on T4.  Best checkpoint -> checkpoints/finetune/best.pt
+# ------------------------------------------------------------------------------
 
 subprocess.run(
     [sys.executable, str(WORK / "training" / "finetune.py")],
@@ -169,9 +170,9 @@ subprocess.run(
     check=True,
 )
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── CELL 9 · Summary ─────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# -- CELL 9 . Summary
+# ==============================================================================
 
 import json
 
@@ -185,7 +186,7 @@ for ckpt in [pretrain_ckpt, finetune_ckpt]:
         print(f"  epoch : {meta['epoch']}")
         print(f"  loss  : {meta['loss']:.4f}")
     else:
-        print(f"\n{ckpt} — not found")
+        print(f"\n{ckpt} - not found")
 
-print(f"\nAll done ✓")
+print(f"\nAll done OK")
 print(f"wandb dashboard: https://wandb.ai/{os.environ.get('WANDB_ENTITY','(check your account)')}/MIMIC-IV-ICU")
