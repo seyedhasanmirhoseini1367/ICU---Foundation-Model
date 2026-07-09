@@ -1,8 +1,22 @@
 # data files — never push to GitHub
 sample/
 dataloader/all_stays/
+dataloader/train_index.csv
+dataloader/val_index.csv
+dataloader/_tmp_split.csv
 *.csv
 *.ipynb
+
+# Raw MIMIC source data (downloaded separately)
+iii/
+iv/
+
+# Generated tokenizer artifacts (rebuild with tokenizer/build_vocab.py)
+tokenizer/vocab.json
+tokenizer/norm_stats.json
+
+# Model checkpoints
+checkpoints/
 
 # Python cache
 __pycache__/
