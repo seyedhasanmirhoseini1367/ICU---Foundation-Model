@@ -30,8 +30,11 @@ import torch
 print(f"PyTorch : {torch.__version__}")
 print(f"CUDA    : {torch.cuda.is_available()}")
 if torch.cuda.is_available():
-    props = torch.cuda.get_device_properties(0)
-    print(f"GPU     : {props.name}  ({props.total_memory/1e9:.1f} GB VRAM)")
+    try:
+        props = torch.cuda.get_device_properties(0)
+        print(f"GPU     : {props.name}  ({props.total_memory/1e9:.1f} GB VRAM)")
+    except Exception:
+        print("GPU     : available (properties unavailable)")
 
 # ==============================================================================
 # -- CELL 2 . wandb authentication
@@ -42,12 +45,14 @@ import wandb
 try:
     from kaggle_secrets import UserSecretsClient
     _key = UserSecretsClient().get_secret("WANDB_API_KEY")
-    wandb.login(key=_key)
+    wandb.login(key=_key, relogin=True)
     os.environ["USE_WANDB"] = "1"
+    os.environ["WANDB_START_METHOD"] = "thread"
     print("wandb   : authenticated OK")
 except Exception as e:
     os.environ["USE_WANDB"] = "0"
     print(f"wandb   : skipped ({e})")
+    print("         To enable wandb: Notebook -> Add-ons -> Secrets -> WANDB_API_KEY")
 
 # ==============================================================================
 # -- CELL 3 . Clone repo
@@ -73,30 +78,38 @@ sys.path.insert(0, str(WORK))
 # -- CELL 4 . Inspect dataset & detect MIMIC root
 # ==============================================================================
 
-DATA_BASE = Path("/kaggle/input/icu-datasets")
+KAGGLE_INPUT = Path("/kaggle/input")
 
-print(f"\nDataset root: {DATA_BASE}")
-print("Top-level structure:")
-for item in sorted(DATA_BASE.iterdir()):
-    size = ""
-    if item.is_file():
-        size = f"  {item.stat().st_size/1e6:.0f} MB"
-    kind = "[DIR]" if item.is_dir() else "[FILE]"
-    print(f"  {kind} {item.name}{size}")
+print(f"\nSearching for MIMIC data under {KAGGLE_INPUT}")
+print("Available dataset directories:")
+available = []
+for item in sorted(KAGGLE_INPUT.iterdir()):
+    if item.is_dir():
+        available.append(item)
+        print(f"  [DIR] {item.name}")
+        for sub in sorted(item.iterdir()):
+            print(f"        {'[DIR]' if sub.is_dir() else '[FILE]'} {sub.name}")
+
+if not available:
+    raise RuntimeError(
+        "No datasets found under /kaggle/input. "
+        "Please attach the dataset luciadam/icu-datasets via "
+        "Notebook -> Add Data -> Datasets -> luciadam/icu-datasets"
+    )
 
 
 def find_mimic_root(base: Path) -> Path:
-    """Search for the folder that has both icu/ and hosp/ subdirectories."""
+    """Search for the folder that contains both icu/ and hosp/ subdirectories."""
     for root, dirs, _ in os.walk(base):
         if "icu" in dirs and "hosp" in dirs:
             return Path(root)
     raise FileNotFoundError(
         f"Could not find icu/ + hosp/ under {base}.\n"
-        "Check the dataset structure above and set MIMIC_ROOT manually."
+        "Directories found: " + ", ".join(str(d) for d in available)
     )
 
 
-MIMIC_ROOT = find_mimic_root(DATA_BASE)
+MIMIC_ROOT = find_mimic_root(KAGGLE_INPUT)
 print(f"\nMIMIC root detected: {MIMIC_ROOT}")
 
 # Verify key files exist
@@ -106,9 +119,15 @@ _required = [
     MIMIC_ROOT / "hosp" / "admissions.csv",
     MIMIC_ROOT / "hosp" / "patients.csv",
 ]
+all_ok = True
 for f in _required:
     status = "OK" if f.exists() else "MISSING"
-    print(f"  {status}  {f.relative_to(DATA_BASE)}")
+    if status == "MISSING":
+        all_ok = False
+    print(f"  {status}  {f.relative_to(MIMIC_ROOT)}")
+
+if not all_ok:
+    raise FileNotFoundError("Some required MIMIC files are missing. Check paths above.")
 
 # ==============================================================================
 # -- CELL 5 . Extract all stays
@@ -117,7 +136,7 @@ for f in _required:
 # First run:  ~30-60 min  (reads chartevents.csv which is several GB)
 # Resumable:  already-extracted stays are skipped automatically.
 #
-# To test with 50 patients first, add:  --n 50
+# To test with 50 patients first, uncomment: "--n", "50"
 # ------------------------------------------------------------------------------
 
 STAYS_DIR = WORK / "dataloader" / "all_stays"
@@ -131,7 +150,7 @@ subprocess.run([
     "--root",  str(MIMIC_ROOT),
     "--out",   str(STAYS_DIR),
     "--index", str(WORK / "dataloader" / "index.csv"),
-    # "--n", "50",      <- uncomment to test with 50 patients only
+    # "--n", "50",
 ], check=True)
 
 # ==============================================================================
@@ -174,8 +193,6 @@ subprocess.run(
 # -- CELL 9 . Summary
 # ==============================================================================
 
-import json
-
 pretrain_ckpt = WORK / "checkpoints" / "pretrain" / "best.pt"
 finetune_ckpt = WORK / "checkpoints" / "finetune" / "best.pt"
 
@@ -189,4 +206,4 @@ for ckpt in [pretrain_ckpt, finetune_ckpt]:
         print(f"\n{ckpt} - not found")
 
 print(f"\nAll done OK")
-print(f"wandb dashboard: https://wandb.ai/{os.environ.get('WANDB_ENTITY','(check your account)')}/MIMIC-IV-ICU")
+print(f"wandb: https://wandb.ai/seyedhasan-mirhoseini1367-tampere-university/MIMIC-IV-ICU")
