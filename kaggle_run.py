@@ -58,12 +58,14 @@ os.chdir(WORK)
 
 REPO_URL = "https://github.com/seyedhasanmirhoseini1367/ICU---Foundation-Model.git"
 
-if not (WORK / "training").exists():
-    subprocess.run(["git", "clone", REPO_URL, "."], check=True)
-    print("Repo    : cloned ✓")
-else:
+if (WORK / ".git").exists():
     subprocess.run(["git", "pull"], check=True)
     print("Repo    : up to date ✓")
+else:
+    subprocess.run(["git", "init"], check=True)
+    subprocess.run(["git", "remote", "add", "origin", REPO_URL], check=True)
+    subprocess.run(["git", "pull", "origin", "main"], check=True)
+    print("Repo    : cloned ✓")
 
 sys.path.insert(0, str(WORK))
 
