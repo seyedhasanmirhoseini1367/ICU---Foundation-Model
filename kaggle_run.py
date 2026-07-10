@@ -215,16 +215,23 @@ else:
     _already = len(list(STAYS_DIR.glob("*.csv")))
     print(f"Already extracted: {_already} stays  (will be skipped)")
 
-    subprocess.run([
+    N_PATIENTS = 50   # set to 0 for full run (all 65k patients)
+
+    cmd = [
         sys.executable, str(WORK / "dataloader" / "extract.py"),
         "--root",  str(MIMIC_ROOT),
         "--out",   str(STAYS_DIR),
         "--index", str(INDEX_PATH),
-        # "--n", "50",
-    ], check=True)
+    ]
+    if N_PATIENTS > 0:
+        cmd += ["--n", str(N_PATIENTS)]
+        print(f"TEST MODE: extracting {N_PATIENTS} patients only")
 
-    # Auto-save so future runs skip extraction entirely
-    _save_extracted_as_dataset()
+    subprocess.run(cmd, check=True)
+
+    # Only save dataset on full run (not test)
+    if N_PATIENTS == 0:
+        _save_extracted_as_dataset()
 
 # ==============================================================================
 # -- CELL 6 . Build vocabulary & normalisation stats
