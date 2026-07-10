@@ -65,16 +65,16 @@ if not _SKIP_INIT:
 WORK = Path("/kaggle/working")
 os.chdir(WORK)
 
-REPO_URL = "https://github.com/seyedhasanmirhoseini1367/ICU---Foundation-Model.git"
-
-if (WORK / ".git").exists():
-    subprocess.run(["git", "pull"], check=True)
-    print("Repo    : up to date OK")
-else:
-    subprocess.run(["git", "init"], check=True)
-    subprocess.run(["git", "remote", "add", "origin", REPO_URL], check=True)
-    subprocess.run(["git", "pull", "origin", "main"], check=True)
-    print("Repo    : cloned OK")
+if not _SKIP_INIT:
+    REPO_URL = "https://github.com/seyedhasanmirhoseini1367/ICU---Foundation-Model.git"
+    if (WORK / ".git").exists():
+        subprocess.run(["git", "pull", "origin", "main"], check=True)
+        print("Repo    : up to date OK")
+    else:
+        subprocess.run(["git", "init"], check=True)
+        subprocess.run(["git", "remote", "add", "origin", REPO_URL], check=True)
+        subprocess.run(["git", "pull", "origin", "main"], check=True)
+        print("Repo    : cloned OK")
 
 sys.path.insert(0, str(WORK))
 
