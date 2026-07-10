@@ -34,6 +34,7 @@ import pandas as pd
 
 from model.config          import ModelConfig
 from model.model           import ICUFoundationModel
+from model.heads           import VITAL_NAMES, N_VITALS
 from dataloader.dataloader import make_dataloader
 from training.utils        import (
     AverageMeter, EarlyStopping,
@@ -120,11 +121,14 @@ def train_one_epoch(model, loader, optimizer, device) -> dict:
     total_m = AverageMeter("loss")
     mort_m  = AverageMeter("mortality_loss")
     los_m   = AverageMeter("los_loss")
+    vital_m = AverageMeter("vital_loss")
 
     for inputs, labels in loader:
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        mort_labels = labels["hospital_expire_flag"].float().to(device)
-        los_labels  = labels["los"].float().to(device)
+        inputs       = {k: v.to(device) for k, v in inputs.items()}
+        mort_labels  = labels["hospital_expire_flag"].float().to(device)
+        los_labels   = labels["los"].float().to(device)
+        vital_labels = labels["vital_targets"].to(device)   # [B, N_VITALS]
+        vital_mask   = labels["vital_mask"].to(device)      # [B, N_VITALS]
 
         out = model.forward(
             mode             = "finetune",
@@ -135,6 +139,8 @@ def train_one_epoch(model, loader, optimizer, device) -> dict:
             padding_mask     = inputs["padding_mask"],
             mortality_labels = mort_labels,
             los_labels       = los_labels,
+            vital_labels     = vital_labels,
+            vital_mask       = vital_mask,
         )
 
         optimizer.zero_grad()
@@ -143,28 +149,35 @@ def train_one_epoch(model, loader, optimizer, device) -> dict:
         optimizer.step()
 
         n = inputs["itemid"].size(0)
-        total_m.update(out["loss"].item(),             n)
-        mort_m.update(out["mortality_loss"].item(),    n)
-        los_m.update(out["los_loss"].item(),           n)
+        total_m.update(out["loss"].item(),          n)
+        mort_m.update(out["mortality_loss"].item(), n)
+        los_m.update(out["los_loss"].item(),        n)
+        vital_m.update(out["vital_loss"].item(),    n)
 
     return {
         "loss"          : total_m.avg,
         "mortality_loss": mort_m.avg,
         "los_loss"      : los_m.avg,
+        "vital_loss"    : vital_m.avg,
     }
 
 
 @torch.no_grad()
 def evaluate(model, loader, device) -> dict:
     model.eval()
-    loss_m     = AverageMeter("val_loss")
-    all_labels = []
-    all_logits = []
+    loss_m      = AverageMeter("val_loss")
+    all_labels  = []
+    all_logits  = []
+    # Per-vital: accumulate (pred, target) pairs for MAE
+    vital_preds_all  = [[] for _ in range(N_VITALS)]
+    vital_labels_all = [[] for _ in range(N_VITALS)]
 
     for inputs, labels in loader:
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        mort_labels = labels["hospital_expire_flag"].float().to(device)
-        los_labels  = labels["los"].float().to(device)
+        inputs       = {k: v.to(device) for k, v in inputs.items()}
+        mort_labels  = labels["hospital_expire_flag"].float().to(device)
+        los_labels   = labels["los"].float().to(device)
+        vital_labels = labels["vital_targets"].to(device)
+        vital_mask   = labels["vital_mask"].to(device)
 
         out = model.forward(
             mode             = "finetune",
@@ -175,11 +188,23 @@ def evaluate(model, loader, device) -> dict:
             padding_mask     = inputs["padding_mask"],
             mortality_labels = mort_labels,
             los_labels       = los_labels,
+            vital_labels     = vital_labels,
+            vital_mask       = vital_mask,
         )
 
         loss_m.update(out["loss"].item(), inputs["itemid"].size(0))
         all_labels.append(mort_labels.cpu())
         all_logits.append(out["mortality_logits"].cpu())
+
+        # Collect per-vital predictions for MAE computation
+        vp = out["vital_preds"].cpu()   # [B, N_VITALS]
+        vl = vital_labels.cpu()         # [B, N_VITALS]
+        vm = vital_mask.cpu()           # [B, N_VITALS]
+        for i in range(N_VITALS):
+            mask_i = vm[:, i]
+            if mask_i.any():
+                vital_preds_all[i].append(vp[mask_i, i])
+                vital_labels_all[i].append(vl[mask_i, i])
 
     all_labels = torch.cat(all_labels).numpy()
     all_logits = torch.cat(all_logits).numpy()
@@ -189,7 +214,17 @@ def evaluate(model, loader, device) -> dict:
     except ValueError:
         auroc = float("nan")
 
-    return {"val_loss": loss_m.avg, "auroc": auroc}
+    # Per-vital MAE (in normalised space; lower = better)
+    vital_mae = {}
+    for i, name in enumerate(VITAL_NAMES):
+        if vital_preds_all[i]:
+            p = torch.cat(vital_preds_all[i])
+            t = torch.cat(vital_labels_all[i])
+            vital_mae[name] = float((p - t).abs().mean())
+        else:
+            vital_mae[name] = float("nan")
+
+    return {"val_loss": loss_m.avg, "auroc": auroc, "vital_mae": vital_mae}
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -270,11 +305,12 @@ def main():
     optimizer   = AdamW(head_params, lr=LR_HEADS_ONLY, weight_decay=WEIGHT_DECAY)
     m = train_one_epoch(model, train_loader, optimizer, device)
     print(f"  Epoch 01  loss={m['loss']:.4f}  mort={m['mortality_loss']:.4f}"
-          f"  los={m['los_loss']:.4f}")
+          f"  los={m['los_loss']:.4f}  vital={m['vital_loss']:.4f}")
     _wlog({
         "finetune/train_loss"    : m["loss"],
         "finetune/mortality_loss": m["mortality_loss"],
         "finetune/los_loss"      : m["los_loss"],
+        "finetune/vital_loss"    : m["vital_loss"],
         "epoch": 1,
     }, step=1)
 
@@ -289,21 +325,33 @@ def main():
         train_m = train_one_epoch(model, train_loader, optimizer, device)
         eval_m  = evaluate(model, val_loader, device)
 
+        mae_str = "  ".join(
+            f"{n}={v:.3f}" for n, v in eval_m["vital_mae"].items()
+            if not np.isnan(v)
+        )
         print(f"  Epoch {epoch:02d}"
               f"  train={train_m['loss']:.4f}"
               f"  val={eval_m['val_loss']:.4f}"
               f"  AUROC={eval_m['auroc']:.3f}"
               f"  mort={train_m['mortality_loss']:.4f}"
-              f"  los={train_m['los_loss']:.4f}")
+              f"  los={train_m['los_loss']:.4f}"
+              f"  vital={train_m['vital_loss']:.4f}")
+        if mae_str:
+            print(f"    vital MAE: {mae_str}")
 
-        _wlog({
+        wlog_dict = {
             "finetune/train_loss"    : train_m["loss"],
             "finetune/val_loss"      : eval_m["val_loss"],
             "finetune/auroc"         : eval_m["auroc"],
             "finetune/mortality_loss": train_m["mortality_loss"],
             "finetune/los_loss"      : train_m["los_loss"],
+            "finetune/vital_loss"    : train_m["vital_loss"],
             "epoch": epoch,
-        }, step=epoch)
+        }
+        for name, mae in eval_m["vital_mae"].items():
+            if not np.isnan(mae):
+                wlog_dict[f"finetune/mae_{name}"] = mae
+        _wlog(wlog_dict, step=epoch)
 
         save_checkpoint(model, optimizer, epoch, eval_m["val_loss"],
                         CKPT_DIR / f"epoch_{epoch:03d}.pt")

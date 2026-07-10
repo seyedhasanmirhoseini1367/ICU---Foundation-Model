@@ -18,10 +18,12 @@ Three operating modes controlled by the `mode` argument to forward():
         Returns:  {'loss', 'itemid_loss', 'value_loss'}
 
     mode='finetune'
-        Supervised downstream training.
-        Requires: mortality_labels, los_labels.
-        Returns:  {'loss', 'mortality_loss', 'los_loss',
-                   'mortality_logits', 'los_preds'}
+        Supervised downstream training (mortality + LOS + vital forecasting).
+        Requires: mortality_labels, los_labels,
+                  vital_labels [B, N_VITALS], vital_mask [B, N_VITALS].
+        Returns:  {'loss', 'mortality_loss', 'los_loss', 'vital_loss',
+                   'mortality_logits', 'los_preds', 'vital_preds'}
+        Loss = 1.0*BCE(mort) + 0.05*MSE(LOS) + 0.5*masked_MSE(vitals)
 
     mode='encode'
         Inference / embedding extraction — no labels needed.
@@ -35,7 +37,7 @@ import torch.nn.functional as F
 from model.config    import ModelConfig
 from model.embedding import ICUEventEmbedding
 from model.encoder   import TransformerEncoder
-from model.heads     import PretrainHead, MortalityHead, LOSHead
+from model.heads     import PretrainHead, MortalityHead, LOSHead, ForecastHead
 
 
 class ICUFoundationModel(nn.Module):
@@ -52,6 +54,7 @@ class ICUFoundationModel(nn.Module):
         self.pretrain_head  = PretrainHead(config)
         self.mortality_head = MortalityHead(config)
         self.los_head       = LOSHead(config)
+        self.forecast_head  = ForecastHead(config)
 
         self._init_weights()
 
@@ -140,30 +143,45 @@ class ICUFoundationModel(nn.Module):
         delta_hours      : torch.Tensor,
         value            : torch.Tensor,
         padding_mask     : torch.Tensor,
-        mortality_labels : torch.Tensor,   # [B]  float  0 or 1
-        los_labels       : torch.Tensor,   # [B]  float  days
+        mortality_labels : torch.Tensor,   # [B]      float  0 or 1
+        los_labels       : torch.Tensor,   # [B]      float  days
+        vital_labels     : torch.Tensor,   # [B, N_VITALS]  normalised values
+        vital_mask       : torch.Tensor,   # [B, N_VITALS]  bool True=observed
     ) -> dict:
         """
-        Supervised fine-tuning loss.
-        L = BCE(mortality) + MSE(LOS)
+        Multi-task fine-tuning loss.
+        L = 1.0*BCE(mortality) + 0.05*MSE(LOS) + 0.5*masked_MSE(vitals)
+        Loss weights balance the different scales of each task.
         """
         cls_output, _ = self.encode(itemid, source, delta_hours, value, padding_mask)
 
         mortality_logits = self.mortality_head(cls_output)   # [B]
         los_preds        = self.los_head(cls_output)         # [B]
+        vital_preds      = self.forecast_head(cls_output)    # [B, N_VITALS]
 
         mortality_loss = F.binary_cross_entropy_with_logits(
-            mortality_logits,
-            mortality_labels.float(),
+            mortality_logits, mortality_labels.float(),
         )
         los_loss = F.mse_loss(los_preds, los_labels.float())
 
+        if vital_mask.any():
+            vital_loss = F.mse_loss(
+                vital_preds[vital_mask],
+                vital_labels[vital_mask],
+            )
+        else:
+            vital_loss = torch.tensor(0.0, device=cls_output.device)
+
+        total_loss = mortality_loss + 0.05 * los_loss + 0.5 * vital_loss
+
         return {
-            "loss"             : mortality_loss + los_loss,
+            "loss"             : total_loss,
             "mortality_loss"   : mortality_loss.detach(),
             "los_loss"         : los_loss.detach(),
+            "vital_loss"       : vital_loss.detach(),
             "mortality_logits" : mortality_logits.detach(),
             "los_preds"        : los_preds.detach(),
+            "vital_preds"      : vital_preds.detach(),
         }
 
     # ── Unified entry point ────────────────────────────────────────────────────

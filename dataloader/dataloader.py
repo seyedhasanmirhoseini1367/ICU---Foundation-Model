@@ -30,10 +30,13 @@ Usage:
 """
 
 import json
+import numpy as np
 import pandas as pd
 import torch
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
+
+from model.heads import VITAL_ITEMIDS, N_VITALS
 
 # Maps the string source column in stay CSVs to an integer for source_emb
 SOURCE_MAP = {"CHART": 0, "INPUT": 1, "OUTPUT": 2, "LAB": 3}
@@ -113,33 +116,47 @@ class ICUDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[dict, dict]:
         row = self.index.iloc[idx]
 
-        # ── 1. Load and clean the stay timeline ─────────────────────────────
-        df = pd.read_csv(self.data_dir / row["file_path"])
+        # ── 1. Load the raw stay CSV (kept intact for vital target extraction)
+        df_raw = pd.read_csv(self.data_dir / row["file_path"])
+
+        # ── 2. Vital forecast targets — events AFTER the input window ─────────
+        #    Input window = first (max_len - 1) events (CLS takes slot 0).
+        #    Future window = everything from index max_len-1 onwards in df_raw.
+        #    For each vital: mean normalised value in the future window.
+        #    vital_mask is False where a vital was never measured there.
+        df_future = df_raw.iloc[self.max_len - 1:]
+        vital_targets = np.zeros(N_VITALS, dtype=np.float32)
+        vital_mask    = np.zeros(N_VITALS, dtype=bool)
+        for i, iid in enumerate(VITAL_ITEMIDS):
+            vals = df_future.loc[df_future["itemid"] == iid, "value"].dropna()
+            if len(vals) > 0:
+                vital_targets[i] = self._zscore(float(vals.mean()), iid)
+                vital_mask[i]    = True
+
+        # ── 3. Build model input from the full df_raw ─────────────────────────
+        df = df_raw.copy()
         df["source"] = df["source"].map(SOURCE_MAP).fillna(0).astype(int)
         df = df[["delta_hours", "source", "itemid", "value"]].fillna(0)
 
-        # ── 2. Normalise values BEFORE vocab mapping ─────────────────────────
-        #    (norm_stats keys are raw itemids, not token indices)
+        # ── 4. Normalise values BEFORE vocab mapping ──────────────────────────
         df["value"] = [
             self._zscore(v, iid)
             for v, iid in zip(df["value"].values, df["itemid"].values)
         ]
 
-        # ── 3. Map raw itemids to vocab token indices ─────────────────────────
+        # ── 5. Map raw itemids to vocab token indices ─────────────────────────
         df["itemid"] = [self._to_token_idx(int(iid)) for iid in df["itemid"].values]
 
-        # ── 4. Prepend [CLS] at position 0 ───────────────────────────────────
-        #    [CLS] has itemid=CLS_TOKEN_ID, source=0, delta_hours=0, value=0
+        # ── 6. Prepend [CLS] at position 0 ───────────────────────────────────
         cls_row = pd.DataFrame(
             [[0.0, 0, CLS_TOKEN_ID, 0.0]],
             columns=df.columns,
         )
         df = pd.concat([cls_row, df], ignore_index=True)
 
-        # ── 5. Truncate or pad to max_len ─────────────────────────────────────
+        # ── 7. Truncate or pad to max_len ─────────────────────────────────────
         n = len(df)
         if n >= self.max_len:
-            # Keep [CLS] (index 0) + first max_len-1 events
             df   = df.iloc[: self.max_len].reset_index(drop=True)
             mask = [True] * self.max_len
         else:
@@ -151,7 +168,7 @@ class ICUDataset(Dataset):
             df   = pd.concat([df, pad_rows], ignore_index=True)
             mask = [True] * n + [False] * pad_count
 
-        # ── 6. Build input tensors ────────────────────────────────────────────
+        # ── 8. Build input tensors ────────────────────────────────────────────
         inputs = {
             "itemid"      : torch.tensor(df["itemid"].values,      dtype=torch.long),
             "source"      : torch.tensor(df["source"].values,      dtype=torch.long),
@@ -160,12 +177,14 @@ class ICUDataset(Dataset):
             "padding_mask": torch.tensor(mask,                     dtype=torch.bool),
         }
 
-        # ── 7. Build label dict ───────────────────────────────────────────────
+        # ── 9. Build label dict ───────────────────────────────────────────────
         labels = {
             "hospital_expire_flag": int(row["hospital_expire_flag"]),
             "los"                 : float(row["los"]),
             "age"                 : int(row["age"]),
             "gender"              : 0 if row["gender"] == "M" else 1,
+            "vital_targets"       : torch.tensor(vital_targets, dtype=torch.float32),
+            "vital_mask"          : torch.tensor(vital_mask,    dtype=torch.bool),
         }
 
         return inputs, labels
