@@ -40,18 +40,18 @@ if torch.cuda.is_available():
 # -- CELL 2 . wandb authentication
 # ==============================================================================
 
-# Must be set BEFORE importing wandb to avoid subprocess service startup failure
-os.environ["WANDB_START_METHOD"] = "thread"
-os.environ["WANDB_SERVICE_WAIT"] = "300"
+# Do NOT call wandb.login() here — it starts a service subprocess that fails
+# in Kaggle containers. Instead, set WANDB_API_KEY as an env var.
+# pretrain.py and finetune.py pick it up automatically via wandb.init().
 
-import wandb
+os.environ["WANDB_START_METHOD"] = "thread"
 
 try:
     from kaggle_secrets import UserSecretsClient
     _key = UserSecretsClient().get_secret("WANDB_API_KEY")
-    wandb.login(key=_key, relogin=True)
+    os.environ["WANDB_API_KEY"] = _key
     os.environ["USE_WANDB"] = "1"
-    print("wandb   : authenticated OK")
+    print("wandb   : API key set OK")
 except Exception as e:
     os.environ["USE_WANDB"] = "0"
     print(f"wandb   : skipped ({e})")
