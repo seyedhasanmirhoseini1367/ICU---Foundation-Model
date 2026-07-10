@@ -40,21 +40,36 @@ if torch.cuda.is_available():
 # -- CELL 2 . wandb authentication
 # ==============================================================================
 
-# Do NOT call wandb.login() here — it starts a service subprocess that fails
-# in Kaggle containers. Instead, set WANDB_API_KEY as an env var.
-# pretrain.py and finetune.py pick it up automatically via wandb.init().
+import time as _time
 
 os.environ["WANDB_START_METHOD"] = "thread"
 
-try:
-    from kaggle_secrets import UserSecretsClient
-    _key = UserSecretsClient().get_secret("WANDB_API_KEY")
+_key = None
+
+# Retry up to 3 times — secrets service may not be ready at kernel start
+for _attempt in range(3):
+    try:
+        from kaggle_secrets import UserSecretsClient
+        _key = UserSecretsClient().get_secret("WANDB_API_KEY")
+        break
+    except Exception as _e:
+        if _attempt < 2:
+            print(f"wandb   : secrets not ready, retrying in 10s ... ({_e})")
+            _time.sleep(10)
+        else:
+            print(f"wandb   : UserSecretsClient failed ({_e})")
+
+# Fallback: key may already be in environment
+if not _key:
+    _key = os.environ.get("WANDB_API_KEY", "").strip()
+
+if _key:
     os.environ["WANDB_API_KEY"] = _key
-    os.environ["USE_WANDB"] = "1"
+    os.environ["USE_WANDB"]     = "1"
     print("wandb   : API key set OK")
-except Exception as e:
+else:
     os.environ["USE_WANDB"] = "0"
-    print(f"wandb   : skipped ({e})")
+    print("wandb   : skipped - check Add-ons -> Secrets -> toggle WANDB_API_KEY ON")
 
 # ==============================================================================
 # -- CELL 3 . Clone repo
