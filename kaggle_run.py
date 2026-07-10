@@ -132,28 +132,99 @@ if not all_ok:
     raise FileNotFoundError("Some required MIMIC files are missing. Check paths above.")
 
 # ==============================================================================
-# -- CELL 5 . Extract all stays
+# -- CELL 5 . Extract all stays  (or load from pre-extracted dataset)
 # ==============================================================================
 #
-# First run:  ~30-60 min  (reads chartevents.csv which is several GB)
-# Resumable:  already-extracted stays are skipped automatically.
-#
-# To test with 50 patients first, uncomment: "--n", "50"
+# If the pre-extracted dataset (seyedhasanmirhoseini/mimic-iv-icu-stays) is
+# attached, we unzip it (~5 min) instead of re-extracting (~9 hours).
+# On first run: extraction runs, then auto-saves a private Kaggle dataset.
 # ------------------------------------------------------------------------------
 
-STAYS_DIR = WORK / "dataloader" / "all_stays"
+import json as _json, zipfile as _zipfile, shutil as _shutil
+
+STAYS_DIR      = WORK / "dataloader" / "all_stays"
+INDEX_PATH     = WORK / "dataloader" / "index.csv"
+PRE_EXTRACTED  = Path("/kaggle/input/mimic-iv-icu-stays")   # our saved dataset
+STAYS_ZIP_NAME = "extracted_stays.zip"
+
 STAYS_DIR.mkdir(parents=True, exist_ok=True)
 
-_already = len(list(STAYS_DIR.glob("*.csv")))
-print(f"Already extracted: {_already} stays  (will be skipped)")
 
-subprocess.run([
-    sys.executable, str(WORK / "dataloader" / "extract.py"),
-    "--root",  str(MIMIC_ROOT),
-    "--out",   str(STAYS_DIR),
-    "--index", str(WORK / "dataloader" / "index.csv"),
-    # "--n", "50",
-], check=True)
+def _save_extracted_as_dataset():
+    """Zip the extracted stays and publish as a private Kaggle dataset."""
+    zip_path = WORK / STAYS_ZIP_NAME
+    print("\nZipping extracted stays for future runs ...")
+    with _zipfile.ZipFile(zip_path, "w", _zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        for f in sorted(STAYS_DIR.glob("*.csv")):
+            zf.write(f, f"stays/{f.name}")
+        if INDEX_PATH.exists():
+            zf.write(INDEX_PATH, "index.csv")
+    size_mb = zip_path.stat().st_size / 1e6
+    print(f"  Zip size : {size_mb:.0f} MB")
+
+    ds_dir = WORK / "_ds_upload"
+    ds_dir.mkdir(exist_ok=True)
+    _shutil.copy(zip_path, ds_dir / STAYS_ZIP_NAME)
+
+    meta = {
+        "title"    : "MIMIC-IV ICU Extracted Stays",
+        "id"       : "seyedhasanmirhoseini/mimic-iv-icu-stays",
+        "licenses" : [{"name": "other"}],
+        "isPrivate": True,
+    }
+    (ds_dir / "dataset-metadata.json").write_text(_json.dumps(meta, indent=2))
+
+    # Try create first; if dataset exists already, push a new version
+    r = subprocess.run(
+        [sys.executable, "-m", "kaggle", "datasets", "create",
+         "-p", str(ds_dir), "--dir-mode", "zip"],
+        capture_output=True, text=True,
+    )
+    if r.returncode == 0:
+        print("  Saved as NEW dataset : seyedhasanmirhoseini/mimic-iv-icu-stays")
+    else:
+        r2 = subprocess.run(
+            [sys.executable, "-m", "kaggle", "datasets", "version",
+             "-p", str(ds_dir), "-m", "updated extraction", "--dir-mode", "zip"],
+            capture_output=True, text=True,
+        )
+        if r2.returncode == 0:
+            print("  Updated dataset version : seyedhasanmirhoseini/mimic-iv-icu-stays")
+        else:
+            print(f"  Dataset save failed (non-fatal): {r2.stderr[:300]}")
+
+
+if (PRE_EXTRACTED / STAYS_ZIP_NAME).exists():
+    # ── Fast path: unzip pre-extracted stays (~5 min) ────────────────────────
+    print("Pre-extracted dataset found — unzipping instead of re-extracting ...")
+    with _zipfile.ZipFile(PRE_EXTRACTED / STAYS_ZIP_NAME) as zf:
+        members = zf.namelist()
+        for member in members:
+            if member.startswith("stays/"):
+                fname = Path(member).name
+                with zf.open(member) as src, open(STAYS_DIR / fname, "wb") as dst:
+                    _shutil.copyfileobj(src, dst)
+            elif member == "index.csv":
+                with zf.open(member) as src, open(INDEX_PATH, "wb") as dst:
+                    _shutil.copyfileobj(src, dst)
+    n_loaded = len(list(STAYS_DIR.glob("*.csv")))
+    print(f"Loaded {n_loaded:,} pre-extracted stays OK")
+
+else:
+    # ── Slow path: full extraction (~9 hours) ────────────────────────────────
+    _already = len(list(STAYS_DIR.glob("*.csv")))
+    print(f"Already extracted: {_already} stays  (will be skipped)")
+
+    subprocess.run([
+        sys.executable, str(WORK / "dataloader" / "extract.py"),
+        "--root",  str(MIMIC_ROOT),
+        "--out",   str(STAYS_DIR),
+        "--index", str(INDEX_PATH),
+        # "--n", "50",
+    ], check=True)
+
+    # Auto-save so future runs skip extraction entirely
+    _save_extracted_as_dataset()
 
 # ==============================================================================
 # -- CELL 6 . Build vocabulary & normalisation stats
