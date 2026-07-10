@@ -161,6 +161,7 @@ subprocess.run([
 
 subprocess.run(
     [sys.executable, str(WORK / "tokenizer" / "build_vocab.py")],
+    env={**os.environ, "PYTHONPATH": str(WORK)},
     check=True,
 )
 
@@ -174,7 +175,9 @@ subprocess.run(
 
 subprocess.run(
     [sys.executable, str(WORK / "training" / "pretrain.py")],
-    env={**os.environ, "USE_WANDB": os.environ.get("USE_WANDB", "0")},
+    env={**os.environ,
+         "USE_WANDB":   os.environ.get("USE_WANDB", "0"),
+         "PYTHONPATH":  str(WORK)},
     check=True,
 )
 
@@ -187,7 +190,9 @@ subprocess.run(
 
 subprocess.run(
     [sys.executable, str(WORK / "training" / "finetune.py")],
-    env={**os.environ, "USE_WANDB": os.environ.get("USE_WANDB", "0")},
+    env={**os.environ,
+         "USE_WANDB":   os.environ.get("USE_WANDB", "0"),
+         "PYTHONPATH":  str(WORK)},
     check=True,
 )
 
