@@ -49,8 +49,23 @@ NORM_PATH     = ROOT / "tokenizer" / "norm_stats.json"
 PRETRAIN_CKPT = ROOT / "checkpoints" / "pretrain" / "best.pt"
 CKPT_DIR      = ROOT / "checkpoints" / "finetune"
 
+# ── GPU capability gate ───────────────────────────────────────────────────────
+def _cuda_ok() -> bool:
+    """True only when the GPU supports PyTorch 2.x (CUDA capability >= sm_70)."""
+    if not torch.cuda.is_available():
+        return False
+    cap = torch.cuda.get_device_capability(0)
+    if cap[0] < 7:
+        name = torch.cuda.get_device_name(0)
+        print(f"WARNING: {name} has CUDA capability sm_{cap[0]}{cap[1]} "
+              f"(PyTorch 2.x requires sm_70+) — using CPU instead.")
+        return False
+    return True
+
+_CUDA_OK = _cuda_ok()
+
 # ── Hyperparameters ───────────────────────────────────────────────────────────
-BATCH_SIZE    = 32 if torch.cuda.is_available() else 8
+BATCH_SIZE    = 32 if _CUDA_OK else 8
 MAX_EPOCHS    = 30
 LR_HEADS_ONLY = 1e-3
 LR_FULL_MODEL = 1e-5
@@ -180,9 +195,9 @@ def evaluate(model, loader, device) -> dict:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if _CUDA_OK else "cpu")
     print(f"Device      : {device}")
-    if torch.cuda.is_available():
+    if _CUDA_OK:
         print(f"GPU         : {torch.cuda.get_device_name(0)}")
 
     vocab  = json.loads(VOCAB_PATH.read_text())
