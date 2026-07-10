@@ -217,7 +217,7 @@ else:
     _already = len(list(STAYS_DIR.glob("*.csv")))
     print(f"Already extracted: {_already} stays  (will be skipped)")
 
-    N_PATIENTS = 50   # set to 0 for full run (all 65k patients)
+    N_PATIENTS = 0    # 0 = full run (all 65k patients); set to 50 for a quick test
 
     cmd = [
         sys.executable, str(WORK / "dataloader" / "extract.py"),
