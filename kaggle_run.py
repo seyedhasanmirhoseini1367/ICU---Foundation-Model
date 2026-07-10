@@ -17,59 +17,46 @@ Expected total runtime: ~4-6 hours on T4 GPU
 import os, sys, subprocess
 from pathlib import Path
 
-# ==============================================================================
-# -- CELL 1 . Environment
-# ==============================================================================
+# When called from runner.ipynb, install/auth/clone are already done.
+_SKIP_INIT = os.environ.get("PIPELINE_SKIP_INIT", "0") == "1"
 
-subprocess.run(
-    [sys.executable, "-m", "pip", "install", "-q", "wandb", "duckdb", "tqdm"],
-    check=True,
-)
+if not _SKIP_INIT:
+    # ===========================================================================
+    # -- CELL 1 . Environment
+    # ===========================================================================
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", "wandb", "duckdb", "tqdm"],
+        check=True,
+    )
 
-import torch
-print(f"PyTorch : {torch.__version__}")
-print(f"CUDA    : {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    try:
-        props = torch.cuda.get_device_properties(0)
-        print(f"GPU     : {props.name}  ({props.total_memory/1e9:.1f} GB VRAM)")
-    except Exception:
-        print("GPU     : available (properties unavailable)")
+    import torch
+    print(f"PyTorch : {torch.__version__}")
+    print(f"CUDA    : {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        try:
+            props = torch.cuda.get_device_properties(0)
+            print(f"GPU     : {props.name}  ({props.total_memory/1e9:.1f} GB VRAM)")
+        except Exception:
+            print("GPU     : available (properties unavailable)")
 
-# ==============================================================================
-# -- CELL 2 . wandb authentication
-# ==============================================================================
-
-import time as _time
-
-os.environ["WANDB_START_METHOD"] = "thread"
-
-_key = None
-
-# Retry up to 3 times — secrets service may not be ready at kernel start
-for _attempt in range(3):
-    try:
-        from kaggle_secrets import UserSecretsClient
-        _key = UserSecretsClient().get_secret("WANDB_API_KEY")
-        break
-    except Exception as _e:
-        if _attempt < 2:
-            print(f"wandb   : secrets not ready, retrying in 10s ... ({_e})")
-            _time.sleep(10)
-        else:
-            print(f"wandb   : UserSecretsClient failed ({_e})")
-
-# Fallback: key may already be in environment
-if not _key:
+    # ===========================================================================
+    # -- CELL 2 . wandb authentication
+    # ===========================================================================
+    os.environ["WANDB_START_METHOD"] = "thread"
     _key = os.environ.get("WANDB_API_KEY", "").strip()
-
-if _key:
-    os.environ["WANDB_API_KEY"] = _key
-    os.environ["USE_WANDB"]     = "1"
-    print("wandb   : API key set OK")
-else:
-    os.environ["USE_WANDB"] = "0"
-    print("wandb   : skipped - check Add-ons -> Secrets -> toggle WANDB_API_KEY ON")
+    if not _key:
+        try:
+            from kaggle_secrets import UserSecretsClient
+            _key = UserSecretsClient().get_secret("WANDB_API_KEY")
+        except Exception as _e:
+            print(f"wandb   : UserSecretsClient failed ({_e})")
+    if _key:
+        os.environ["WANDB_API_KEY"] = _key
+        os.environ["USE_WANDB"]     = "1"
+        print("wandb   : API key set OK")
+    else:
+        os.environ["USE_WANDB"] = "0"
+        print("wandb   : skipped")
 
 # ==============================================================================
 # -- CELL 3 . Clone repo
