@@ -135,8 +135,8 @@ def preload_parquet(con, icu: Path, hosp: Path) -> dict:
         "labevents"   : (hosp / "labevents.csv",     work / "labevents.parquet"),
     }
 
-    # Temporarily allow more memory for the conversion pass
-    con.execute("PRAGMA memory_limit='10GB'")
+    # Use most available RAM for the one-time conversion pass
+    con.execute("PRAGMA memory_limit='20GB'")
 
     paths = {}
     for name, (csv_path, pq_path) in sources.items():
@@ -148,7 +148,7 @@ def preload_parquet(con, icu: Path, hosp: Path) -> dict:
             print(f"  {name}: converting {size_gb:.1f} GB CSV → Parquet ...", flush=True)
             con.execute(f"""
                 COPY (SELECT * FROM read_csv_auto('{p(csv_path)}', ignore_errors=true))
-                TO '{p(pq_path)}' (FORMAT PARQUET, COMPRESSION 'snappy')
+                TO '{p(pq_path)}' (FORMAT PARQUET, COMPRESSION 'zstd')
             """)
             size_mb = pq_path.stat().st_size / 1e6
             print(f"    done: {size_mb:.0f} MB", flush=True)

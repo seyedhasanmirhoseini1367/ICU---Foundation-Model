@@ -229,7 +229,26 @@ else:
         cmd += ["--n", str(N_PATIENTS)]
         print(f"TEST MODE: extracting {N_PATIENTS} patients only")
 
-    subprocess.run(cmd, check=True)
+    # Redirect extraction output to a log file to avoid notebook JSON overflow
+    # (65k tqdm lines + 41GB Parquet conversion output would corrupt the notebook)
+    _extract_log = WORK / "extraction.log"
+    print(f"Extraction log → {_extract_log}")
+    print("Progress updates every 60 s ...")
+    import time as _time
+    with open(_extract_log, "w") as _log:
+        _proc = subprocess.Popen(cmd, stdout=_log, stderr=_log)
+        while _proc.poll() is None:
+            _time.sleep(60)
+            # Print a brief progress line from the last checkpoint line in the log
+            try:
+                _lines = _extract_log.read_text(errors="replace").splitlines()
+                _ckpt  = [l for l in _lines if "Checkpoint:" in l or "done:" in l or "converting" in l]
+                if _ckpt:
+                    print(f"  [{int(_time.time()%86400)//3600:02d}h] {_ckpt[-1].strip()}")
+            except Exception:
+                pass
+        if _proc.returncode != 0:
+            raise subprocess.CalledProcessError(_proc.returncode, cmd)
 
     # Only save dataset on full run (not test)
     if N_PATIENTS == 0:
