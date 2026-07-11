@@ -116,13 +116,67 @@ def load_labels(con, hosp: Path, sid_str: str) -> pd.DataFrame:
     """).df()
 
 
-def load_events_batch(con, icu: Path, hosp: Path, sid_str: str) -> tuple:
-    """Load all 4 event tables for a batch of subjects."""
+def preload_parquet(con, icu: Path, hosp: Path) -> dict:
+    """
+    Convert the four large event CSVs to Parquet once, then register them as
+    DuckDB views.  Subsequent batch queries read from fast columnar Parquet
+    instead of rescanning the raw CSV each time — cuts extraction from ~9h to ~1h.
+    Returns a dict mapping table name → path string for use in queries.
+    """
+    work = Path("/kaggle/working")
+    if not work.exists():          # local dev fallback
+        work = icu.parent.parent / "parquet_cache"
+    work.mkdir(parents=True, exist_ok=True)
+
+    sources = {
+        "chartevents" : (icu  / "chartevents.csv",  work / "chartevents.parquet"),
+        "inputevents" : (icu  / "inputevents.csv",   work / "inputevents.parquet"),
+        "outputevents": (icu  / "outputevents.csv",  work / "outputevents.parquet"),
+        "labevents"   : (hosp / "labevents.csv",     work / "labevents.parquet"),
+    }
+
+    # Temporarily allow more memory for the conversion pass
+    con.execute("PRAGMA memory_limit='10GB'")
+
+    paths = {}
+    for name, (csv_path, pq_path) in sources.items():
+        if pq_path.exists():
+            size_mb = pq_path.stat().st_size / 1e6
+            print(f"  {name}: cached ({size_mb:.0f} MB)", flush=True)
+        elif csv_path.exists():
+            size_gb = csv_path.stat().st_size / 1e9
+            print(f"  {name}: converting {size_gb:.1f} GB CSV → Parquet ...", flush=True)
+            con.execute(f"""
+                COPY (SELECT * FROM read_csv_auto('{p(csv_path)}', ignore_errors=true))
+                TO '{p(pq_path)}' (FORMAT PARQUET, COMPRESSION 'snappy')
+            """)
+            size_mb = pq_path.stat().st_size / 1e6
+            print(f"    done: {size_mb:.0f} MB", flush=True)
+        else:
+            print(f"  {name}: CSV not found — skipping", flush=True)
+            paths[name] = None
+            continue
+        paths[name] = p(pq_path)
+
+    # Back to a conservative limit for per-batch queries
+    con.execute("PRAGMA memory_limit='6GB'")
+    return paths
+
+
+def load_events_batch(con, pq: dict, icu: Path, hosp: Path, sid_str: str) -> tuple:
+    """Load all 4 event tables for a batch of subjects from Parquet (fast path)
+    or CSV fallback when a Parquet file is unavailable."""
+
+    def src(name, csv_path):
+        if pq.get(name):
+            return f"read_parquet('{pq[name]}')"
+        return f"read_csv_auto('{p(csv_path)}', ignore_errors=true)"
+
     chart = con.execute(f"""
         SELECT c.subject_id, c.stay_id,
                c.charttime AS time, 'CHART' AS source,
                c.itemid, d.label, c.valuenum AS value, c.valueuom AS unit
-        FROM read_csv_auto('{p(icu)}/chartevents.csv', ignore_errors=true) c
+        FROM {src('chartevents', icu / 'chartevents.csv')} c
         JOIN read_csv_auto('{p(icu)}/d_items.csv') d ON c.itemid = d.itemid
         WHERE c.subject_id IN ({sid_str})
           AND c.valuenum IS NOT NULL AND c.warning = 0
@@ -132,7 +186,7 @@ def load_events_batch(con, icu: Path, hosp: Path, sid_str: str) -> tuple:
         SELECT i.subject_id, i.stay_id,
                i.starttime AS time, 'INPUT' AS source,
                i.itemid, d.label, i.amount AS value, i.amountuom AS unit
-        FROM read_csv_auto('{p(icu)}/inputevents.csv', ignore_errors=true) i
+        FROM {src('inputevents', icu / 'inputevents.csv')} i
         JOIN read_csv_auto('{p(icu)}/d_items.csv') d ON i.itemid = d.itemid
         WHERE i.subject_id IN ({sid_str})
           AND i.statusdescription != 'Rewritten'
@@ -142,7 +196,7 @@ def load_events_batch(con, icu: Path, hosp: Path, sid_str: str) -> tuple:
         SELECT o.subject_id, o.stay_id,
                o.charttime AS time, 'OUTPUT' AS source,
                o.itemid, d.label, o.value AS value, o.valueuom AS unit
-        FROM read_csv_auto('{p(icu)}/outputevents.csv', ignore_errors=true) o
+        FROM {src('outputevents', icu / 'outputevents.csv')} o
         JOIN read_csv_auto('{p(icu)}/d_items.csv') d ON o.itemid = d.itemid
         WHERE o.subject_id IN ({sid_str})
     """).df()
@@ -151,7 +205,7 @@ def load_events_batch(con, icu: Path, hosp: Path, sid_str: str) -> tuple:
         SELECT l.subject_id, l.hadm_id,
                l.charttime AS time, 'LAB' AS source,
                l.itemid, d.label, l.valuenum AS value, l.valueuom AS unit
-        FROM read_csv_auto('{p(hosp)}/labevents.csv', ignore_errors=true) l
+        FROM {src('labevents', hosp / 'labevents.csv')} l
         JOIN read_csv_auto('{p(hosp)}/d_labitems.csv') d ON l.itemid = d.itemid
         WHERE l.subject_id IN ({sid_str})
           AND l.valuenum IS NOT NULL
@@ -214,8 +268,12 @@ def main():
     print(f"Extracting : {n_label}  ->  {out_dir}\n")
 
     con = duckdb.connect()
-    con.execute("PRAGMA memory_limit='4GB'")
     con.execute("PRAGMA threads=4")
+
+    # -- Convert large CSVs to Parquet (one-time ~10 min, then cached) ---------
+    print("Caching event tables as Parquet for fast batch access ...", flush=True)
+    pq = preload_parquet(con, icu, hosp)
+    print()
 
     # -- Load stays (small, fine in memory) ------------------------------------
     print("Loading ICU stays ...", flush=True)
@@ -250,7 +308,7 @@ def main():
               flush=True)
         print("  Loading events ...", flush=True)
 
-        chart, inp, out_ev, lab = load_events_batch(con, icu, hosp, sid_str_batch)
+        chart, inp, out_ev, lab = load_events_batch(con, pq, icu, hosp, sid_str_batch)
         print(f"  chart={len(chart):,}  inp={len(inp):,}  "
               f"out={len(out_ev):,}  lab={len(lab):,}", flush=True)
 
