@@ -166,7 +166,8 @@ def _save_extracted_as_dataset():
 
     ds_dir = WORK / "_ds_upload"
     ds_dir.mkdir(exist_ok=True)
-    _shutil.copy(zip_path, ds_dir / STAYS_ZIP_NAME)
+    # Move (not copy) to avoid needing an extra 1.7 GB of free space
+    _shutil.move(str(zip_path), str(ds_dir / STAYS_ZIP_NAME))
 
     meta = {
         "title"    : "MIMIC-IV ICU Extracted Stays",

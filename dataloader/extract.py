@@ -385,6 +385,14 @@ def main():
     index = pd.DataFrame(index_rows)
     index.to_csv(idx_path, index=False)
 
+    # Free Parquet cache to reclaim disk space before the zip step
+    freed = 0
+    for pq_file in Path("/kaggle/working").glob("*.parquet"):
+        freed += pq_file.stat().st_size
+        pq_file.unlink()
+    if freed:
+        print(f"\nFreed {freed/1e9:.1f} GB Parquet cache from disk.")
+
     print(f"\nDone.")
     print(f"  Stays extracted : {extracted}")
     print(f"  Stays skipped   : {skipped}")
