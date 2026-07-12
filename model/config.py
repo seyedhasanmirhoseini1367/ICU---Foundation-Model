@@ -13,12 +13,19 @@ from dataclasses import dataclass
 class ModelConfig:
 
     # ── Vocabulary ──────────────────────────────────────────────────────────
-    # vocab_size is set after build_vocab.py runs (number of unique itemids + 3 special tokens)
+    # vocab_size is set after build_vocab.py runs (unique itemids + 4 special tokens)
     vocab_size    : int   = 5000
     pad_token_id  : int   = 0     # [PAD]  — ignored by attention and loss
     mask_token_id : int   = 1     # [MASK] — replaces events during MEM pretraining
     cls_token_id  : int   = 2     # [CLS]  — prepended; its output is the patient summary
+    unk_token_id  : int   = 3     # [UNK]  — unknown itemid encountered at inference
     source_size   : int   = 4     # number of event sources: CHART / INPUT / OUTPUT / LAB
+
+    # ── Value discretisation (Masked Event Modeling) ─────────────────────────
+    # Raw measurement values are binned into per-itemid quantiles for the
+    # pretrain loss (CE over bins instead of MSE on the raw float).
+    # The bin edges are computed by build_vocab.py and stored in bin_edges.json.
+    n_value_bins  : int   = 10    # number of quantile bins per itemid
 
     # ── Transformer dimensions ──────────────────────────────────────────────
     d_model  : int = 256    # dimension of every token embedding
@@ -34,7 +41,19 @@ class ModelConfig:
 
     # ── Pretraining (Masked Event Modeling) ─────────────────────────────────
     mask_prob         : float = 0.15  # fraction of real events masked each step
-    value_loss_weight : float = 0.5   # λ: total = λ·CE(itemid) + (1-λ)·MSE(value)
+    value_loss_weight : float = 0.5   # λ: total = λ·CE(itemid) + (1-λ)·CE(value_bins)
+
+    # ── VICReg (contrastive CLS objective, optional) ─────────────────────────
+    # Two differently masked views of each batch are created during pretraining.
+    # VICReg is computed between their projected [CLS] representations.
+    # Enabled via USE_VICREG=1 environment variable (disabled by default on Kaggle).
+    vicreg_lambda : float = 25.0   # variance term weight
+    vicreg_mu     : float = 25.0   # invariance term weight
+    vicreg_nu     : float = 1.0    # covariance term weight
+    vicreg_weight : float = 0.1    # scalar weight on the total VICReg loss
+
+    # ── Reproducibility ──────────────────────────────────────────────────────
+    random_seed : int = 42
 
     def __post_init__(self):
         assert self.d_model % self.n_heads == 0, (

@@ -14,6 +14,14 @@ iv/
 # Generated tokenizer artifacts (rebuild with tokenizer/build_vocab.py)
 tokenizer/vocab.json
 tokenizer/norm_stats.json
+tokenizer/bin_edges.json
+
+# Large HTML reference files (schema / handbook) — not part of the model code
+*.html
+
+# Pretrain internal split files
+checkpoints/pretrain/_pretrain_train.csv
+checkpoints/pretrain/_pretrain_val.csv
 
 # Model checkpoints
 checkpoints/

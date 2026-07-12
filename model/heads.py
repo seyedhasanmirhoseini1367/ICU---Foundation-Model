@@ -8,9 +8,13 @@ Phase 1 — Pretraining  (Masked Event Modeling)
 ─────────────────────────────────────────────────────────────
 PretrainHead
     Input  : full sequence output  [B, L, d_model]
-    Outputs: itemid_logits         [B, L, vocab_size]  → CrossEntropy
-             value_preds           [B, L]              → MSE
+    Outputs: itemid_logits         [B, L, vocab_size]     → CrossEntropy
+             value_logits          [B, L, n_value_bins]   → CrossEntropy over bins
     Loss computed only at masked positions (training loop handles masking).
+
+    Both objectives use CrossEntropy — itemid predicts which measurement was masked,
+    value_bins predicts which decile bin the masked value fell into.
+    This avoids MSE's heavy-tail dominance problem on clinical measurements.
 
 ─────────────────────────────────────────────────────────────
 Phase 2 — Fine-tuning  (supervised downstream tasks)
@@ -20,7 +24,7 @@ All heads take the [CLS] token representation as input [B, d_model].
 MortalityHead   → binary classification  (did the patient die?)
 LOSHead         → regression             (ICU length of stay in days)
 ForecastHead    → regression per vital   (future vital sign values, normalised)
-                  Targets: mean of each vital in events AFTER the input window.
+                  Targets: mean of each vital in the LAST 20% of the stay's events.
                   Vitals: HR, SpO2, RR, SBP, DBP, MAP, Temperature (7 total).
 """
 
@@ -37,9 +41,9 @@ from model.config import ModelConfig
 
 class PretrainHead(nn.Module):
     """
-    Predicts the masked event's itemid (classification) and value (regression).
-    Applied to every position in the sequence, but the training loop computes
-    loss only at masked positions using the provided label tensors.
+    Predicts the masked event's itemid (classification) and value quantile bin
+    (classification over decile bins). Applied to every position in the sequence,
+    but the training loop computes loss only at masked positions.
     """
 
     def __init__(self, config: ModelConfig):
@@ -53,11 +57,11 @@ class PretrainHead(nn.Module):
             nn.Linear(config.d_model, config.vocab_size),
         )
 
-        # Value prediction: single scalar output
+        # Value bin prediction: classify into n_value_bins decile bins
         self.value_head = nn.Sequential(
             nn.Linear(config.d_model, config.d_model // 2),
             nn.GELU(),
-            nn.Linear(config.d_model // 2, 1),
+            nn.Linear(config.d_model // 2, config.n_value_bins),
         )
 
     def forward(
@@ -65,16 +69,15 @@ class PretrainHead(nn.Module):
         sequence_output: torch.Tensor,  # [B, L, d_model]
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
-        itemid_logits = self.itemid_head(sequence_output)         # [B, L, vocab_size]
-        value_preds   = self.value_head(sequence_output).squeeze(-1)  # [B, L]
+        itemid_logits = self.itemid_head(sequence_output)   # [B, L, vocab_size]
+        value_logits  = self.value_head(sequence_output)    # [B, L, n_value_bins]
 
-        return itemid_logits, value_preds
+        return itemid_logits, value_logits
 
 
 class MortalityHead(nn.Module):
     """
     Binary classifier: did the patient die in hospital?
-    (label = hospital_expire_flag from MIMIC admissions table)
     Output is a raw logit — apply sigmoid externally or use BCE-with-logits.
     """
 
@@ -89,7 +92,6 @@ class MortalityHead(nn.Module):
         )
 
     def forward(self, cls_output: torch.Tensor) -> torch.Tensor:
-        # cls_output: [B, d_model]
         return self.classifier(cls_output).squeeze(-1)  # [B]  raw logit
 
 
@@ -110,7 +112,6 @@ class LOSHead(nn.Module):
         )
 
     def forward(self, cls_output: torch.Tensor) -> torch.Tensor:
-        # cls_output: [B, d_model]
         return self.regressor(cls_output).squeeze(-1)   # [B]
 
 
@@ -119,10 +120,10 @@ class ForecastHead(nn.Module):
     Predicts normalised future vital sign values from the [CLS] token.
 
     The 7 vitals (HR, SpO2, RR, SBP, DBP, MAP, Temp) are the mean of each
-    vital's z-scored values measured AFTER the model's input window
-    (i.e., events at raw-CSV index >= max_len - 1).  Where a vital is not
-    observed in that future window, vital_mask is False and the position is
-    excluded from the MSE loss.
+    vital's z-scored values measured in the LAST 20% of the stay's events
+    (i.e., events at raw-CSV index >= 80% of total stay length).
+    Where a vital is not observed in that future window, vital_mask is False
+    and the position is excluded from the MSE loss.
     """
 
     def __init__(self, config: ModelConfig):

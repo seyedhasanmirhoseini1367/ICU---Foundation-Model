@@ -1,7 +1,8 @@
 """
 training/finetune.py
 
-Phase 2: Supervised fine-tuning on mortality prediction and LOS regression.
+Phase 2: Supervised fine-tuning on mortality prediction, LOS regression,
+and vital sign forecasting.
 
 Train / validation split is done by PATIENT (subject_id) so no patient
 appears in both sets — prevents data leakage when one patient has multiple stays.
@@ -9,7 +10,10 @@ Default: 80% train / 20% val.
 
 Two-stage strategy:
     Stage 2a — Epoch 1:  encoder frozen, heads only (lr=1e-3)
-    Stage 2b — Epoch 2+: full model, lower lr (lr=1e-5)
+                          Warms up the randomly-initialised heads before
+                          the encoder is unfrozen.
+    Stage 2b — Epoch 2+: full model with cosine LR schedule + linear warmup
+                          (lr peaks at 1e-5 after warmup_epochs, then decays)
 
 Run:
     python training/finetune.py
@@ -19,16 +23,18 @@ Checkpoints saved to:
     checkpoints/finetune/best.pt
 
 wandb:
-    Set USE_WANDB=1 to enable. Kaggle script sets this automatically.
+    Set USE_WANDB=1 to enable.
 """
 
 import json
+import math
 import os
 import numpy as np
 import torch
 from pathlib import Path
 from sklearn.metrics import roc_auc_score
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, SequentialLR
 
 import pandas as pd
 
@@ -47,12 +53,12 @@ DATA_DIR      = ROOT / "dataloader" / "all_stays"
 INDEX_PATH    = ROOT / "dataloader" / "index.csv"
 VOCAB_PATH    = ROOT / "tokenizer" / "vocab.json"
 NORM_PATH     = ROOT / "tokenizer" / "norm_stats.json"
+BIN_EDGES_PATH = ROOT / "tokenizer" / "bin_edges.json"
 PRETRAIN_CKPT = ROOT / "checkpoints" / "pretrain" / "best.pt"
 CKPT_DIR      = ROOT / "checkpoints" / "finetune"
 
 # ── GPU capability gate ───────────────────────────────────────────────────────
 def _cuda_ok() -> bool:
-    """True only when the GPU supports PyTorch 2.x (CUDA capability >= sm_70)."""
     if not torch.cuda.is_available():
         return False
     cap = torch.cuda.get_device_capability(0)
@@ -73,7 +79,7 @@ LR_FULL_MODEL = 1e-5
 WEIGHT_DECAY  = 1e-2
 PATIENCE      = 5
 VAL_FRACTION  = 0.20
-RANDOM_SEED   = 42
+WARMUP_EPOCHS = 2    # linear LR warmup for stage 2b before cosine decay
 
 # ── wandb ─────────────────────────────────────────────────────────────────────
 USE_WANDB     = os.getenv("USE_WANDB", "0") == "1"
@@ -90,12 +96,6 @@ def _wlog(metrics: dict, step: int):
 # ── Train / val split by patient ──────────────────────────────────────────────
 
 def patient_split(index_path: Path, val_fraction: float, seed: int):
-    """
-    Split index.csv into train/val by subject_id.
-
-    Splitting by patient (not by stay) ensures a patient with multiple
-    ICU stays never appears in both sets.
-    """
     index    = pd.read_csv(index_path)
     subjects = index["subject_id"].unique()
 
@@ -106,7 +106,6 @@ def patient_split(index_path: Path, val_fraction: float, seed: int):
     train_df = index[~index["subject_id"].isin(val_subj)].reset_index(drop=True)
     val_df   = index[ index["subject_id"].isin(val_subj)].reset_index(drop=True)
 
-    # Persist splits alongside index.csv for reproducibility
     out_dir = index_path.parent
     train_df.to_csv(out_dir / "train_index.csv", index=False)
     val_df.to_csv(  out_dir / "val_index.csv",   index=False)
@@ -114,9 +113,29 @@ def patient_split(index_path: Path, val_fraction: float, seed: int):
     return train_df, val_df
 
 
+# ── LR schedule helpers ───────────────────────────────────────────────────────
+
+def make_stage2b_scheduler(
+    optimizer    : torch.optim.Optimizer,
+    warmup_steps : int,
+    total_steps  : int,
+):
+    """
+    Linear warmup for warmup_steps, then cosine annealing to 0.
+    warmup_steps = WARMUP_EPOCHS * batches_per_epoch.
+    """
+    def warmup_lambda(step):
+        if step < warmup_steps:
+            return float(step) / max(1, warmup_steps)
+        progress = float(step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    return LambdaLR(optimizer, lr_lambda=warmup_lambda)
+
+
 # ── Epoch helpers ─────────────────────────────────────────────────────────────
 
-def train_one_epoch(model, loader, optimizer, device) -> dict:
+def train_one_epoch(model, loader, optimizer, device, scheduler=None) -> dict:
     model.train()
     total_m = AverageMeter("loss")
     mort_m  = AverageMeter("mortality_loss")
@@ -127,8 +146,8 @@ def train_one_epoch(model, loader, optimizer, device) -> dict:
         inputs       = {k: v.to(device) for k, v in inputs.items()}
         mort_labels  = labels["hospital_expire_flag"].float().to(device)
         los_labels   = labels["los"].float().to(device)
-        vital_labels = labels["vital_targets"].to(device)   # [B, N_VITALS]
-        vital_mask   = labels["vital_mask"].to(device)      # [B, N_VITALS]
+        vital_labels = labels["vital_targets"].to(device)
+        vital_mask   = labels["vital_mask"].to(device)
 
         out = model.forward(
             mode             = "finetune",
@@ -147,6 +166,8 @@ def train_one_epoch(model, loader, optimizer, device) -> dict:
         out["loss"].backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         n = inputs["itemid"].size(0)
         total_m.update(out["loss"].item(),          n)
@@ -168,7 +189,6 @@ def evaluate(model, loader, device) -> dict:
     loss_m      = AverageMeter("val_loss")
     all_labels  = []
     all_logits  = []
-    # Per-vital: accumulate (pred, target) pairs for MAE
     vital_preds_all  = [[] for _ in range(N_VITALS)]
     vital_labels_all = [[] for _ in range(N_VITALS)]
 
@@ -196,10 +216,9 @@ def evaluate(model, loader, device) -> dict:
         all_labels.append(mort_labels.cpu())
         all_logits.append(out["mortality_logits"].cpu())
 
-        # Collect per-vital predictions for MAE computation
-        vp = out["vital_preds"].cpu()   # [B, N_VITALS]
-        vl = vital_labels.cpu()         # [B, N_VITALS]
-        vm = vital_mask.cpu()           # [B, N_VITALS]
+        vp = out["vital_preds"].cpu()
+        vl = vital_labels.cpu()
+        vm = vital_mask.cpu()
         for i in range(N_VITALS):
             mask_i = vm[:, i]
             if mask_i.any():
@@ -214,7 +233,6 @@ def evaluate(model, loader, device) -> dict:
     except ValueError:
         auroc = float("nan")
 
-    # Per-vital MAE (in normalised space; lower = better)
     vital_mae = {}
     for i, name in enumerate(VITAL_NAMES):
         if vital_preds_all[i]:
@@ -230,6 +248,7 @@ def evaluate(model, loader, device) -> dict:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    config_seed = ModelConfig().random_seed
     device = torch.device("cuda" if _CUDA_OK else "cpu")
     print(f"Device      : {device}")
     if _CUDA_OK:
@@ -239,14 +258,16 @@ def main():
     config = ModelConfig(vocab_size=len(vocab))
 
     # ── Split by patient ──────────────────────────────────────────────────────
-    print(f"\nSplitting index by patient ({int(VAL_FRACTION*100)}% val) …")
-    train_df, val_df = patient_split(INDEX_PATH, VAL_FRACTION, RANDOM_SEED)
+    print(f"\nSplitting index by patient ({int(VAL_FRACTION*100)}% val) ...")
+    train_df, val_df = patient_split(INDEX_PATH, VAL_FRACTION, config.random_seed)
     print(f"  Train: {len(train_df)} stays ({train_df['subject_id'].nunique()} patients)")
     print(f"  Val  : {len(val_df)}   stays ({val_df['subject_id'].nunique()} patients)")
     print(f"  Mortality — train: {train_df['hospital_expire_flag'].mean():.1%}"
           f"   val: {val_df['hospital_expire_flag'].mean():.1%}")
 
-    def make_loader(df, shuffle):
+    _bin_path = BIN_EDGES_PATH if BIN_EDGES_PATH.exists() else None
+
+    def make_loader(df, shuffle, window_mode):
         tmp = INDEX_PATH.parent / "_tmp_split.csv"
         df.to_csv(tmp, index=False)
         return make_dataloader(
@@ -254,14 +275,16 @@ def main():
             data_dir        = DATA_DIR,
             vocab_path      = VOCAB_PATH,
             norm_stats_path = NORM_PATH,
+            bin_edges_path  = _bin_path,
             max_len         = config.max_len,
             batch_size      = BATCH_SIZE,
             shuffle         = shuffle,
+            window_mode     = window_mode,
         )
 
-    train_loader = make_loader(train_df, shuffle=True)
-    val_loader   = make_loader(val_df,   shuffle=False)
-    print(f"\nBatch size  : {BATCH_SIZE}")
+    train_loader = make_loader(train_df, shuffle=True,  window_mode="random")
+    val_loader   = make_loader(val_df,   shuffle=False, window_mode="last")
+    print(f"\nBatch size   : {BATCH_SIZE}")
     print(f"Train batches: {len(train_loader)}   Val batches: {len(val_loader)}")
 
     # ── Model ─────────────────────────────────────────────────────────────────
@@ -270,7 +293,7 @@ def main():
         load_checkpoint(PRETRAIN_CKPT, model, device=device)
         print(f"Loaded pretrain checkpoint: {PRETRAIN_CKPT}")
     else:
-        print("⚠  No pretrain checkpoint — fine-tuning from random init.")
+        print("No pretrain checkpoint — fine-tuning from random init.")
 
     # ── wandb init ────────────────────────────────────────────────────────────
     if USE_WANDB:
@@ -280,21 +303,22 @@ def main():
             project = WANDB_PROJECT,
             name    = f"finetune-{len(train_df)}train-{len(val_df)}val",
             config  = {
-                "phase"         : "finetune",
-                "n_train"       : len(train_df),
-                "n_val"         : len(val_df),
-                "val_fraction"  : VAL_FRACTION,
-                "vocab_size"    : config.vocab_size,
-                "d_model"       : config.d_model,
-                "n_layers"      : config.n_layers,
-                "n_heads"       : config.n_heads,
-                "batch_size"    : BATCH_SIZE,
-                "lr_heads_only" : LR_HEADS_ONLY,
-                "lr_full_model" : LR_FULL_MODEL,
-                "weight_decay"  : WEIGHT_DECAY,
-                "patience"      : PATIENCE,
-                "max_epochs"    : MAX_EPOCHS,
-                "device"        : str(device),
+                "phase"          : "finetune",
+                "n_train"        : len(train_df),
+                "n_val"          : len(val_df),
+                "val_fraction"   : VAL_FRACTION,
+                "vocab_size"     : config.vocab_size,
+                "d_model"        : config.d_model,
+                "n_layers"       : config.n_layers,
+                "n_heads"        : config.n_heads,
+                "batch_size"     : BATCH_SIZE,
+                "lr_heads_only"  : LR_HEADS_ONLY,
+                "lr_full_model"  : LR_FULL_MODEL,
+                "warmup_epochs"  : WARMUP_EPOCHS,
+                "weight_decay"   : WEIGHT_DECAY,
+                "patience"       : PATIENCE,
+                "max_epochs"     : MAX_EPOCHS,
+                "device"         : str(device),
             },
         )
 
@@ -314,16 +338,24 @@ def main():
         "epoch": 1,
     }, step=1)
 
-    # ── Stage 2b: full model fine-tuning ──────────────────────────────────────
-    print("\n── Stage 2b: full model fine-tuning ──")
+    # ── Stage 2b: full model with cosine LR + warmup ──────────────────────────
+    print("\n── Stage 2b: full model (cosine LR + linear warmup) ──")
     model.unfreeze_all()
     optimizer = AdamW(model.parameters(), lr=LR_FULL_MODEL, weight_decay=WEIGHT_DECAY)
+
+    remaining_epochs = MAX_EPOCHS - 1
+    warmup_steps = WARMUP_EPOCHS * len(train_loader)
+    total_steps  = remaining_epochs * len(train_loader)
+    step_sched   = make_stage2b_scheduler(optimizer, warmup_steps, total_steps)
+
     stopper   = EarlyStopping(patience=PATIENCE)
     best_loss = float("inf")
 
     for epoch in range(2, MAX_EPOCHS + 1):
-        train_m = train_one_epoch(model, train_loader, optimizer, device)
+        train_m = train_one_epoch(model, train_loader, optimizer, device,
+                                  scheduler=step_sched)
         eval_m  = evaluate(model, val_loader, device)
+        current_lr = step_sched.get_last_lr()[0]
 
         mae_str = "  ".join(
             f"{n}={v:.3f}" for n, v in eval_m["vital_mae"].items()
@@ -335,7 +367,8 @@ def main():
               f"  AUROC={eval_m['auroc']:.3f}"
               f"  mort={train_m['mortality_loss']:.4f}"
               f"  los={train_m['los_loss']:.4f}"
-              f"  vital={train_m['vital_loss']:.4f}")
+              f"  vital={train_m['vital_loss']:.4f}"
+              f"  lr={current_lr:.2e}")
         if mae_str:
             print(f"    vital MAE: {mae_str}")
 
@@ -346,6 +379,7 @@ def main():
             "finetune/mortality_loss": train_m["mortality_loss"],
             "finetune/los_loss"      : train_m["los_loss"],
             "finetune/vital_loss"    : train_m["vital_loss"],
+            "finetune/lr"            : current_lr,
             "epoch": epoch,
         }
         for name, mae in eval_m["vital_mae"].items():
