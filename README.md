@@ -35,7 +35,7 @@ Raw ICU stay (events sorted by charttime)
     │  PretrainHead                   │
     │    itemid_logits [B,L,vocab]    │ → CE loss
     │    value_logits  [B,L,10 bins]  │ → CE loss (per-itemid deciles)
-    │  VICReg projector [B,256→256]   │ → VICReg loss (optional)
+    │  VICReg expander  [B,256→512]   │ → VICReg loss (optional)
     └─────────────────────────────────┘
            │
     ┌──────┴──────────────────────────┐
