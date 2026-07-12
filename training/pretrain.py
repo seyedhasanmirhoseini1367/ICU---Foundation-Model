@@ -294,6 +294,17 @@ def main():
     print(f"VICReg      : {'ON' if USE_VICREG else 'OFF'}")
     print(f"Proxy       : {'ON' if USE_PROXY  else 'OFF'}")
 
+    if USE_VICREG:
+        if BATCH_SIZE < 32:
+            raise ValueError(
+                f"USE_VICREG=1 requires batch_size >= 32 for BatchNorm1d in "
+                f"vicreg_expander, but BATCH_SIZE={BATCH_SIZE}. "
+                f"Increase BATCH_SIZE or disable VICReg."
+            )
+        print(f"  [VICReg] expander dim={ModelConfig().vicreg_expand_dim}, "
+              f"batch={BATCH_SIZE}. "
+              f"Two encoder forwards per step — monitor VRAM.")
+
     vocab  = json.loads(VOCAB_PATH.read_text())
     config = ModelConfig(vocab_size=len(vocab))
     print(f"Vocab size  : {config.vocab_size} tokens")

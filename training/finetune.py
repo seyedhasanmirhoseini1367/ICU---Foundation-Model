@@ -15,6 +15,12 @@ Two-stage strategy:
     Stage 2b — Epoch 2+: full model with cosine LR schedule + linear warmup
                           (lr peaks at 1e-5 after warmup_epochs, then decays)
 
+LOS transform:
+    ICU LOS is heavy-tailed (most stays 1-7 days, but can exceed 100 days).
+    Raw MSE on the tail dominates the gradient and destabilises training.
+    Both train and eval apply log1p(days) before MSE — LOSHead predicts
+    log(1 + days_in_ICU).  To recover actual days at inference: expm1(pred).clamp(0).
+
 Run:
     python training/finetune.py
 
@@ -145,7 +151,7 @@ def train_one_epoch(model, loader, optimizer, device, scheduler=None) -> dict:
     for inputs, labels in loader:
         inputs       = {k: v.to(device) for k, v in inputs.items()}
         mort_labels  = labels["hospital_expire_flag"].float().to(device)
-        los_labels   = labels["los"].float().to(device)
+        los_labels   = torch.log1p(labels["los"].float().clamp(min=0.0)).to(device)
         vital_labels = labels["vital_targets"].to(device)
         vital_mask   = labels["vital_mask"].to(device)
 
@@ -195,7 +201,7 @@ def evaluate(model, loader, device) -> dict:
     for inputs, labels in loader:
         inputs       = {k: v.to(device) for k, v in inputs.items()}
         mort_labels  = labels["hospital_expire_flag"].float().to(device)
-        los_labels   = labels["los"].float().to(device)
+        los_labels   = torch.log1p(labels["los"].float().clamp(min=0.0)).to(device)
         vital_labels = labels["vital_targets"].to(device)
         vital_mask   = labels["vital_mask"].to(device)
 

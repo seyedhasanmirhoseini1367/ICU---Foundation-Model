@@ -169,11 +169,19 @@ def main():
     NORM_PATH.write_text(json.dumps(norm_stats,  indent=2))
     BIN_EDGES_PATH.write_text(json.dumps(bin_edges, indent=2))
 
+    n_real_vocab = len(vocab) - FIRST_REAL_IDX
     n_with_edges = sum(1 for v in bin_edges.values() if v)
+    n_no_edges   = n_real_vocab - n_with_edges
+    pct_covered  = 100.0 * n_with_edges / max(1, n_real_vocab)
+
     print(f"\nVocab      : {len(vocab)} tokens  "
-          f"({len(itemid_set)} itemids + {FIRST_REAL_IDX} special)")
+          f"({n_real_vocab} itemids + {FIRST_REAL_IDX} special)")
     print(f"Norm stats : {len(norm_stats)} itemids with mean/std")
-    print(f"Bin edges  : {n_with_edges}/{len(bin_edges)} itemids with {N_VALUE_BINS} bins")
+    print(f"Bin edges  : {n_with_edges}/{n_real_vocab} real itemids have decile bins "
+          f"({pct_covered:.1f}% covered)")
+    if n_no_edges:
+        print(f"           : {n_no_edges} itemids ({100-pct_covered:.1f}%) always map to "
+              f"bin 0 — these have < {N_VALUE_BINS} distinct values in the dataset")
     print(f"\nSaved → {VOCAB_PATH}")
     print(f"Saved → {NORM_PATH}")
     print(f"Saved → {BIN_EDGES_PATH}")

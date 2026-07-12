@@ -100,6 +100,18 @@ class ICUDataset(Dataset):
         if bin_edges_path is not None:
             with open(bin_edges_path) as f:
                 self.bin_edges = json.load(f)
+            # Warn if many vocab items lack decile edges (will always get bin 0)
+            if self.vocab is not None:
+                n_real = sum(1 for k in self.vocab if k not in {"[PAD]","[MASK]","[CLS]","[UNK]"})
+                n_covered = sum(
+                    1 for k in self.vocab
+                    if k not in {"[PAD]","[MASK]","[CLS]","[UNK]"}
+                    and self.bin_edges.get(k)
+                )
+                pct = 100.0 * n_covered / max(1, n_real)
+                if pct < 95.0:
+                    print(f"[bin_edges] {n_covered}/{n_real} vocab itemids have decile bins "
+                          f"({pct:.1f}% covered); {n_real - n_covered} itemids always map to bin 0")
 
     def __len__(self) -> int:
         return len(self.index)

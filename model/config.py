@@ -51,7 +51,12 @@ class ModelConfig:
     # The expander maps [CLS] to a higher-dimensional projection space before
     # VICReg (following the original paper's recommendation to expand, not just
     # project, so that the encoder representations stay information-rich).
-    vicreg_expand_dim : int   = 1024  # expansion dimension for VICReg projector
+    # 512 chosen over 1024: at d_model=256 the 1024-dim expander was ~2.6M params
+    # (35% of total model), disproportionate for a 7.6M-param encoder.
+    # 512-dim expander is ~0.66M params (~9% of total) — proportionate and
+    # fits on T4 without batch halving.
+    # NOTE: BatchNorm1d inside the expander requires batch_size >= 32.
+    vicreg_expand_dim : int   = 512   # expansion dimension for VICReg projector
     vicreg_lambda     : float = 25.0  # variance term weight
     vicreg_mu         : float = 25.0  # invariance term weight
     vicreg_nu         : float = 1.0   # covariance term weight

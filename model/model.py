@@ -66,9 +66,11 @@ class ICUFoundationModel(nn.Module):
         self.proxy_head     = ProxyHead(config)
 
         # ── VICReg expander — 3-layer MLP mapping [CLS] → expanded space ─────
-        # Expands to vicreg_expand_dim (default 1024 > d_model=256) following
+        # Expands to vicreg_expand_dim (default 512 > d_model=256) following
         # the original VICReg paper: expanding keeps the encoder representations
         # information-rich because redundancy is absorbed into the extra dims.
+        # 512 chosen over 1024 to keep expander params proportionate to the
+        # encoder (~9% vs 35% of total params).
         # BatchNorm1d requires batch_size >= 32 to be numerically stable.
         D = config.vicreg_expand_dim
         self.vicreg_expander = nn.Sequential(
@@ -221,7 +223,9 @@ class ICUFoundationModel(nn.Module):
     ) -> dict:
         """
         Multi-task fine-tuning loss.
-        L = 1.0*BCE(mortality) + 0.05*MSE(LOS) + 0.5*masked_MSE(vitals)
+        L = 1.0*BCE(mortality) + 0.05*MSE(log1p_LOS) + 0.5*masked_MSE(vitals)
+        los_labels must be log1p-transformed before calling (done in finetune.py).
+        LOSHead predictions are in log(1+days) space; apply expm1() at inference.
         """
         cls_output, _ = self.encode(itemid, source, delta_hours, value, padding_mask)
 
