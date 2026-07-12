@@ -44,13 +44,24 @@ class ModelConfig:
     value_loss_weight : float = 0.5   # λ: total = λ·CE(itemid) + (1-λ)·CE(value_bins)
 
     # ── VICReg (contrastive CLS objective, optional) ─────────────────────────
-    # Two differently masked views of each batch are created during pretraining.
-    # VICReg is computed between their projected [CLS] representations.
-    # Enabled via USE_VICREG=1 environment variable (disabled by default on Kaggle).
-    vicreg_lambda : float = 25.0   # variance term weight
-    vicreg_mu     : float = 25.0   # invariance term weight
-    vicreg_nu     : float = 1.0    # covariance term weight
-    vicreg_weight : float = 0.1    # scalar weight on the total VICReg loss
+    # Two augmented views of each batch (event dropout + value/timing jitter)
+    # are encoded, and VICReg is applied between their projected [CLS] outputs.
+    # Enabled via USE_VICREG=1 (disabled by default — doubles compute per step).
+    #
+    # The expander maps [CLS] to a higher-dimensional projection space before
+    # VICReg (following the original paper's recommendation to expand, not just
+    # project, so that the encoder representations stay information-rich).
+    vicreg_expand_dim : int   = 1024  # expansion dimension for VICReg projector
+    vicreg_lambda     : float = 25.0  # variance term weight
+    vicreg_mu         : float = 25.0  # invariance term weight
+    vicreg_nu         : float = 1.0   # covariance term weight
+    vicreg_weight     : float = 0.1   # scalar weight on the total VICReg loss
+
+    # ── Proxy-target pretraining (optional) ──────────────────────────────────
+    # Self-supervised stay-level targets derived from the raw data (no labels).
+    # Directly trains [CLS] without needing contrastive augmentation.
+    # Enabled via USE_PROXY=1.
+    proxy_weight : float = 0.1   # scalar weight on the proxy loss
 
     # ── Reproducibility ──────────────────────────────────────────────────────
     random_seed : int = 42

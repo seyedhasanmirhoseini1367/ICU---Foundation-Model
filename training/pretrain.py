@@ -5,12 +5,18 @@ Phase 1: Masked Event Modeling (MEM) pretraining.
 
 Each training step:
     1. Load a clean batch of ICU stay sequences (random window augmentation).
-    2. Create two differently masked views for VICReg (if USE_VICREG=1).
+    2. [USE_PROXY] Pass proxy targets from the dataloader to the model so that
+       [CLS] is directly supervised on stay-level signals (no augmentation needed).
     3. Randomly mask 15% of real events with BERT 80/10/10 strategy.
     4. Forward pass → encoder + PretrainHead.
     5. Loss = λ·CE(itemid) + (1-λ)·CE(value_bins)  [only at masked positions]
-       + vicreg_weight * VICReg([CLS]_1, [CLS]_2)  [optional]
-    6. Backprop + AdamW step + gradient clipping.
+       + proxy_weight * proxy_loss                   [optional, USE_PROXY=1]
+       + vicreg_weight * VICReg([CLS]_1, [CLS]_2)  [optional, USE_VICREG=1]
+    6. [USE_VICREG] Create a second view via ICU-specific augmentation (event
+       dropout + value/timing jitter — NOT [MASK] replacement), encode with
+       mode='encode' to get [CLS] directly, then compute VICReg on the expanded
+       projections from both views.
+    7. Backprop + AdamW step + gradient clipping.
 
 Early stopping uses HELD-OUT VALIDATION LOSS, not train loss.
 The dataset is split 90/10 by patient at run time (no leakage into finetune split).
@@ -28,6 +34,13 @@ wandb:
 VICReg:
     Set USE_VICREG=1 to enable the contrastive CLS objective.
     Disabled by default (doubles compute per step — not suitable for Kaggle T4).
+    Uses augment() (event dropout + value/timing jitter) to create the second view;
+    NOT apply_random_mask(), which would corrupt the sequence for stay-level learning.
+
+Proxy targets:
+    Set USE_PROXY=1 to enable stay-level proxy-target loss on [CLS].
+    Proxy targets are computed in the dataloader from raw data (no human labels).
+    This is the lower-cost complement to VICReg — single forward pass, no augmentation.
 """
 
 import json
@@ -45,7 +58,7 @@ from dataloader.dataloader import make_dataloader
 from training.utils        import (
     AverageMeter, EarlyStopping,
     save_checkpoint, load_checkpoint,
-    apply_random_mask, vicreg_loss,
+    apply_random_mask, augment, vicreg_loss,
 )
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -81,7 +94,8 @@ VAL_FRACTION  = 0.10   # 10% of patients held out for pretrain validation
 
 # ── Feature flags ─────────────────────────────────────────────────────────────
 USE_WANDB  = os.getenv("USE_WANDB",  "0") == "1"
-USE_VICREG = os.getenv("USE_VICREG", "0") == "1"
+USE_VICREG = os.getenv("USE_VICREG", "0") == "1"   # contrastive CLS (doubles compute)
+USE_PROXY  = os.getenv("USE_PROXY",  "1") == "1"   # stay-level proxy targets on [CLS]
 
 WANDB_ENTITY  = "seyedhasan-mirhoseini1367-tampere-university"
 WANDB_PROJECT = "MIMIC-IV-ICU"
@@ -126,15 +140,20 @@ def train_one_epoch(
     total_m  = AverageMeter("loss")
     itemid_m = AverageMeter("itemid_loss")
     value_m  = AverageMeter("value_loss")
+    proxy_m  = AverageMeter("proxy_loss")
     vicreg_m = AverageMeter("vicreg_loss")
 
-    for step, (inputs, _) in enumerate(loader):
+    for step, (inputs, labels) in enumerate(loader):
         inputs = {k: v.to(device) for k, v in inputs.items()}
 
-        # ── MEM: first masked view ─────────────────────────────────────────
+        # ── Proxy targets (stay-level self-supervised signals for [CLS]) ───
+        proxy_targets = proxy_mask = None
+        if USE_PROXY and "proxy_targets" in labels:
+            proxy_targets = labels["proxy_targets"].to(device)
+            proxy_mask    = labels["proxy_mask"].to(device)
+
+        # ── MEM: apply BERT 80/10/10 masking ──────────────────────────────
         masked1, itemid_labels, bin_labels = apply_random_mask(inputs, config)
-        itemid_labels = itemid_labels.to(device)
-        bin_labels    = bin_labels.to(device)
 
         out = model.forward(
             mode             = "pretrain",
@@ -143,38 +162,41 @@ def train_one_epoch(
             delta_hours      = masked1["delta_hours"],
             value            = masked1["value"],
             padding_mask     = masked1["padding_mask"],
-            masked_labels    = itemid_labels,
-            value_bin_labels = bin_labels,
+            masked_labels    = itemid_labels.to(device),
+            value_bin_labels = bin_labels.to(device),
+            proxy_targets    = proxy_targets,
+            proxy_mask       = proxy_mask,
         )
 
-        loss = out["loss"]
+        loss    = out["loss"]
+        prx_val = out["proxy_loss"].item() if USE_PROXY else 0.0
 
-        # ── VICReg: second masked view → contrastive CLS loss ─────────────
+        # ── VICReg: augmented second view → contrastive CLS loss ──────────
+        # IMPORTANT: use augment() (event dropout + value/timing jitter), NOT
+        # apply_random_mask(). apply_random_mask replaces tokens with [MASK],
+        # which corrupts the sequence for stay-level representation learning.
+        # The second view is encoded with mode='encode' (no MEM loss) so the
+        # backward pass only touches the encoder + vicreg_expander for view 2.
         vcr_val = 0.0
         if USE_VICREG:
-            masked2, _, _ = apply_random_mask(inputs, config)
-            with torch.no_grad():
-                # Encode second view; no need to backprop through MEM heads
-                pass
+            aug2 = augment(inputs)    # event dropout + value/timing jitter
             out2 = model.forward(
-                mode             = "pretrain",
-                itemid           = masked2["itemid"],
-                source           = masked2["source"],
-                delta_hours      = masked2["delta_hours"],
-                value            = masked2["value"],
-                padding_mask     = masked2["padding_mask"],
-                masked_labels    = itemid_labels,    # same labels (both views = same stay)
-                value_bin_labels = bin_labels,
+                mode         = "encode",
+                itemid       = aug2["itemid"],
+                source       = aug2["source"],
+                delta_hours  = aug2["delta_hours"],
+                value        = aug2["value"],
+                padding_mask = aug2["padding_mask"],
             )
-            z1 = model.vicreg_projector(out["cls"])
-            z2 = model.vicreg_projector(out2["cls"])
+            z1 = model.vicreg_expander(out["cls"])
+            z2 = model.vicreg_expander(out2["cls"])
             vcr = vicreg_loss(
                 z1, z2,
                 lambda_=config.vicreg_lambda,
                 mu=config.vicreg_mu,
                 nu=config.vicreg_nu,
             )
-            loss = loss + config.vicreg_weight * vcr
+            loss    = loss + config.vicreg_weight * vcr
             vcr_val = vcr.item()
 
         optimizer.zero_grad()
@@ -183,22 +205,29 @@ def train_one_epoch(
         optimizer.step()
 
         n = inputs["itemid"].size(0)
-        total_m.update(loss.item(),               n)
+        total_m.update(loss.item(),                n)
         itemid_m.update(out["itemid_loss"].item(), n)
         value_m.update(out["value_loss"].item(),   n)
-        vicreg_m.update(vcr_val,                  n)
+        proxy_m.update(prx_val,                    n)
+        vicreg_m.update(vcr_val,                   n)
 
         if (step + 1) % max(1, len(loader) // 10) == 0:
+            suffix = ""
+            if USE_PROXY:
+                suffix += f"  proxy={prx_val:.4f}"
+            if USE_VICREG:
+                suffix += f"  vicreg={vcr_val:.4f}"
             print(f"    step {step+1:>4}/{len(loader)}"
                   f"  loss={loss.item():.4f}"
                   f"  itemid={out['itemid_loss'].item():.4f}"
                   f"  value={out['value_loss'].item():.4f}"
-                  + (f"  vicreg={vcr_val:.4f}" if USE_VICREG else ""))
+                  + suffix)
 
     return {
         "loss"       : total_m.avg,
         "itemid_loss": itemid_m.avg,
         "value_loss" : value_m.avg,
+        "proxy_loss" : proxy_m.avg,
         "vicreg_loss": vicreg_m.avg,
     }
 
@@ -210,16 +239,22 @@ def evaluate_pretrain(
     config : ModelConfig,
     device : torch.device,
 ) -> dict:
-    """Compute MEM loss on the held-out validation set."""
+    """Compute MEM (+ optional proxy) loss on the held-out validation set."""
     model.eval()
 
     total_m  = AverageMeter("val_loss")
     itemid_m = AverageMeter("val_itemid_loss")
     value_m  = AverageMeter("val_value_loss")
+    proxy_m  = AverageMeter("val_proxy_loss")
 
-    for inputs, _ in loader:
+    for inputs, labels in loader:
         inputs = {k: v.to(device) for k, v in inputs.items()}
         masked, itemid_labels, bin_labels = apply_random_mask(inputs, config)
+
+        proxy_targets = proxy_mask = None
+        if USE_PROXY and "proxy_targets" in labels:
+            proxy_targets = labels["proxy_targets"].to(device)
+            proxy_mask    = labels["proxy_mask"].to(device)
 
         out = model.forward(
             mode             = "pretrain",
@@ -230,17 +265,22 @@ def evaluate_pretrain(
             padding_mask     = masked["padding_mask"],
             masked_labels    = itemid_labels.to(device),
             value_bin_labels = bin_labels.to(device),
+            proxy_targets    = proxy_targets,
+            proxy_mask       = proxy_mask,
         )
 
         n = inputs["itemid"].size(0)
         total_m.update(out["loss"].item(),         n)
         itemid_m.update(out["itemid_loss"].item(), n)
         value_m.update(out["value_loss"].item(),   n)
+        if USE_PROXY:
+            proxy_m.update(out["proxy_loss"].item(), n)
 
     return {
-        "val_loss"       : total_m.avg,
-        "val_itemid_loss": itemid_m.avg,
-        "val_value_loss" : value_m.avg,
+        "val_loss"        : total_m.avg,
+        "val_itemid_loss" : itemid_m.avg,
+        "val_value_loss"  : value_m.avg,
+        "val_proxy_loss"  : proxy_m.avg,
     }
 
 
@@ -252,6 +292,7 @@ def main():
     if _CUDA_OK:
         print(f"GPU         : {torch.cuda.get_device_name(0)}")
     print(f"VICReg      : {'ON' if USE_VICREG else 'OFF'}")
+    print(f"Proxy       : {'ON' if USE_PROXY  else 'OFF'}")
 
     vocab  = json.loads(VOCAB_PATH.read_text())
     config = ModelConfig(vocab_size=len(vocab))
@@ -323,6 +364,7 @@ def main():
                 "patience"     : PATIENCE,
                 "max_epochs"   : MAX_EPOCHS,
                 "use_vicreg"   : USE_VICREG,
+                "use_proxy"    : USE_PROXY,
                 "device"       : str(device),
             },
         )
@@ -335,13 +377,17 @@ def main():
         scheduler.step()
         lr = scheduler.get_last_lr()[0]
 
-        vicreg_str = f"  vicreg={train_m['vicreg_loss']:.4f}" if USE_VICREG else ""
+        suffix = ""
+        if USE_PROXY:
+            suffix += f"  proxy={train_m['proxy_loss']:.4f}"
+        if USE_VICREG:
+            suffix += f"  vicreg={train_m['vicreg_loss']:.4f}"
         print(f"Epoch {epoch:02d}/{MAX_EPOCHS}"
               f"  train={train_m['loss']:.4f}"
               f"  val={val_m['val_loss']:.4f}"
               f"  itemid={train_m['itemid_loss']:.4f}"
               f"  value={train_m['value_loss']:.4f}"
-              f"{vicreg_str}"
+              f"{suffix}"
               f"  lr={lr:.2e}")
 
         wlog_dict = {
@@ -354,6 +400,9 @@ def main():
             "pretrain/lr"               : lr,
             "epoch"                     : epoch,
         }
+        if USE_PROXY:
+            wlog_dict["pretrain/proxy_loss"]     = train_m["proxy_loss"]
+            wlog_dict["pretrain/val_proxy_loss"] = val_m["val_proxy_loss"]
         if USE_VICREG:
             wlog_dict["pretrain/vicreg_loss"] = train_m["vicreg_loss"]
         _wlog(wlog_dict, step=epoch)

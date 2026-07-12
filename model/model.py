@@ -15,12 +15,12 @@ Components (in order of data flow):
 Three operating modes controlled by the `mode` argument to forward():
 
     mode='pretrain'
-        Applies Masked Event Modeling.
+        Applies Masked Event Modeling + optional proxy-target prediction.
         Requires: masked_labels (itemid), value_bin_labels.
-        Returns:  {'loss', 'itemid_loss', 'value_loss', 'cls'}
-        Loss = λ·CE(itemid) + (1-λ)·CE(value_bins)
-        'cls' is returned to support the optional VICReg objective in the
-        training loop (two forward passes → two [CLS] → vicreg_loss).
+        Optional: proxy_targets [B, N_PROXY_TARGETS], proxy_mask [B, N_PROXY_TARGETS].
+        Returns:  {'loss', 'itemid_loss', 'value_loss', 'proxy_loss', 'cls'}
+        Loss = λ·CE(itemid) + (1-λ)·CE(value_bins) + proxy_weight·proxy_loss
+        'cls' is returned for the optional VICReg objective in the training loop.
 
     mode='finetune'
         Supervised downstream training (mortality + LOS + vital forecasting).
@@ -42,7 +42,10 @@ import torch.nn.functional as F
 from model.config    import ModelConfig
 from model.embedding import ICUEventEmbedding
 from model.encoder   import TransformerEncoder
-from model.heads     import PretrainHead, MortalityHead, LOSHead, ForecastHead
+from model.heads     import (
+    PretrainHead, MortalityHead, LOSHead, ForecastHead, ProxyHead,
+    N_PROXY_TARGETS,
+)
 
 
 class ICUFoundationModel(nn.Module):
@@ -60,18 +63,22 @@ class ICUFoundationModel(nn.Module):
         self.mortality_head = MortalityHead(config)
         self.los_head       = LOSHead(config)
         self.forecast_head  = ForecastHead(config)
+        self.proxy_head     = ProxyHead(config)
 
-        # ── VICReg projector — 3-layer MLP mapping [CLS] → projection space ──
-        # Keeps the projector deeper than the encoder output to avoid losing
-        # task-relevant information in the encoder itself (SimCLR finding).
-        self.vicreg_projector = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model),
-            nn.BatchNorm1d(config.d_model),
+        # ── VICReg expander — 3-layer MLP mapping [CLS] → expanded space ─────
+        # Expands to vicreg_expand_dim (default 1024 > d_model=256) following
+        # the original VICReg paper: expanding keeps the encoder representations
+        # information-rich because redundancy is absorbed into the extra dims.
+        # BatchNorm1d requires batch_size >= 32 to be numerically stable.
+        D = config.vicreg_expand_dim
+        self.vicreg_expander = nn.Sequential(
+            nn.Linear(config.d_model, D),
+            nn.BatchNorm1d(D),
             nn.ReLU(),
-            nn.Linear(config.d_model, config.d_model),
-            nn.BatchNorm1d(config.d_model),
+            nn.Linear(D, D),
+            nn.BatchNorm1d(D),
             nn.ReLU(),
-            nn.Linear(config.d_model, config.d_model),
+            nn.Linear(D, D),
         )
 
         self._init_weights()
@@ -111,38 +118,44 @@ class ICUFoundationModel(nn.Module):
 
     def _forward_pretrain(
         self,
-        itemid           : torch.Tensor,   # [B, L]  — contains [MASK] tokens
+        itemid           : torch.Tensor,           # [B, L]  — contains [MASK] tokens
         source           : torch.Tensor,
         delta_hours      : torch.Tensor,
-        value            : torch.Tensor,   # [B, L]  — zeroed at masked positions
+        value            : torch.Tensor,           # [B, L]  — zeroed at masked positions
         padding_mask     : torch.Tensor,
-        masked_labels    : torch.Tensor,   # [B, L]  original itemid; -100 elsewhere
-        value_bin_labels : torch.Tensor,   # [B, L]  original bin idx; -100 elsewhere
+        masked_labels    : torch.Tensor,           # [B, L]  itemid at masked pos, -100 elsewhere
+        value_bin_labels : torch.Tensor,           # [B, L]  bin idx at masked pos, -100 elsewhere
+        proxy_targets    : torch.Tensor | None = None,  # [B, N_PROXY_TARGETS]
+        proxy_mask       : torch.Tensor | None = None,  # [B, N_PROXY_TARGETS] bool
     ) -> dict:
         """
-        Masked Event Modeling loss.
-        L = λ·CE(itemid) + (1-λ)·CE(value_bins)
-        Both losses computed only at masked positions (ignore_index=-100).
+        Masked Event Modeling + optional proxy-target pretraining loss.
 
-        Using CE for value bins (not MSE on the raw float) provides stronger
-        gradient signal on heavy-tailed clinical measurements.
+        MEM loss: λ·CE(itemid) + (1-λ)·CE(value_bins)
+          - Both terms computed only at masked positions (ignore_index=-100).
+          - CE over bins gives stronger signal than MSE on heavy-tailed vitals.
+
+        Proxy loss (if proxy_targets provided):
+          - Targets 0,1: MSE on continuous values (only where proxy_mask is True).
+          - Targets 2,3: BCE on binary values (vasopressor, critical lab).
+          - Directly trains [CLS] with no augmentation assumption.
+
+        'cls' is always returned for the optional VICReg pass in the training loop.
         """
         cls_output, sequence_output = self.encode(
             itemid, source, delta_hours, value, padding_mask
         )
 
         itemid_logits, value_logits = self.pretrain_head(sequence_output)
-        # itemid_logits: [B, L, vocab_size]
-        # value_logits:  [B, L, n_value_bins]
 
-        # Itemid loss — CE ignores -100
+        # ── MEM itemid loss ───────────────────────────────────────────────────
         itemid_loss = F.cross_entropy(
             itemid_logits.view(-1, self.config.vocab_size),
             masked_labels.view(-1),
             ignore_index=-100,
         )
 
-        # Value bin loss — CE ignores -100
+        # ── MEM value bin loss ────────────────────────────────────────────────
         masked_pos = (value_bin_labels != -100)
         if masked_pos.any():
             value_loss = F.cross_entropy(
@@ -152,14 +165,46 @@ class ICUFoundationModel(nn.Module):
         else:
             value_loss = torch.tensor(0.0, device=cls_output.device)
 
-        lam        = self.config.value_loss_weight
-        total_loss = lam * itemid_loss + (1.0 - lam) * value_loss
+        lam      = self.config.value_loss_weight
+        mem_loss = lam * itemid_loss + (1.0 - lam) * value_loss
+
+        # ── Proxy-target loss (optional) ──────────────────────────────────────
+        proxy_loss = torch.tensor(0.0, device=cls_output.device)
+        if proxy_targets is not None and proxy_mask is not None:
+            proxy_preds = self.proxy_head(cls_output)   # [B, N_PROXY_TARGETS]
+
+            # Target 0: log event count (continuous MSE)
+            valid_0 = proxy_mask[:, 0]
+            if valid_0.any():
+                proxy_loss = proxy_loss + F.mse_loss(
+                    proxy_preds[valid_0, 0], proxy_targets[valid_0, 0]
+                )
+
+            # Target 1: mean HR Z-score (continuous MSE, may be absent)
+            valid_1 = proxy_mask[:, 1]
+            if valid_1.any():
+                proxy_loss = proxy_loss + F.mse_loss(
+                    proxy_preds[valid_1, 1], proxy_targets[valid_1, 1]
+                )
+
+            # Targets 2,3: any vasopressor, any critical lab (binary BCE)
+            proxy_loss = proxy_loss + F.binary_cross_entropy_with_logits(
+                proxy_preds[:, 2], proxy_targets[:, 2]
+            )
+            proxy_loss = proxy_loss + F.binary_cross_entropy_with_logits(
+                proxy_preds[:, 3], proxy_targets[:, 3]
+            )
+
+            proxy_loss = proxy_loss / 4.0   # normalise to comparable scale
+
+        total_loss = mem_loss + self.config.proxy_weight * proxy_loss
 
         return {
             "loss"        : total_loss,
             "itemid_loss" : itemid_loss.detach(),
             "value_loss"  : value_loss.detach(),
-            "cls"         : cls_output,   # returned for optional VICReg in training loop
+            "proxy_loss"  : proxy_loss.detach(),
+            "cls"         : cls_output,
         }
 
     def _forward_finetune(

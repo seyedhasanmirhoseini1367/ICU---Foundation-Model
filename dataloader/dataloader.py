@@ -25,6 +25,7 @@ It is done per-batch in training/pretrain.py via apply_random_mask().
 """
 
 import json
+import math
 import random
 import numpy as np
 import pandas as pd
@@ -32,7 +33,10 @@ import torch
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 
-from model.heads import VITAL_ITEMIDS, N_VITALS
+from model.heads import (
+    VITAL_ITEMIDS, N_VITALS,
+    VASOPRESSOR_ITEMIDS, LACTATE_ITEMIDS, PH_ITEMID, N_PROXY_TARGETS,
+)
 
 SOURCE_MAP = {"CHART": 0, "INPUT": 1, "OUTPUT": 2, "LAB": 3}
 
@@ -61,8 +65,10 @@ class ICUDataset(Dataset):
         los                   float  ICU length of stay in days
         age                   int
         gender                int    0=Male, 1=Female
-        vital_targets         FloatTensor [N_VITALS]  Z-scored future vital means
-        vital_mask            BoolTensor  [N_VITALS]  True where vital was observed
+        vital_targets         FloatTensor [N_VITALS]        Z-scored future vital means
+        vital_mask            BoolTensor  [N_VITALS]        True where vital was observed
+        proxy_targets         FloatTensor [N_PROXY_TARGETS] self-supervised stay targets
+        proxy_mask            BoolTensor  [N_PROXY_TARGETS] True where target is valid
     """
 
     def __init__(
@@ -154,27 +160,51 @@ class ICUDataset(Dataset):
                 vital_targets[i] = self._zscore(float(vals.mean()), iid)
                 vital_mask[i]    = True
 
-        # ── 4. Build model input from the input window ────────────────────────
+        # ── 4. Proxy targets from full stay (self-supervised, no labels needed) ─
+        #    Computed on df_raw (ALL events) before the temporal split.
+        #    Target 0: log-normalised total event count           — always valid
+        #    Target 1: mean Z-scored HR (itemid 220045)          — valid only if HR present
+        #    Target 2: any vasopressor administered               — always valid
+        #    Target 3: any critical lab (lactate>4 or pH<7.25)   — always valid
+        log_count = math.log(n_events + 1) / math.log(5001)
+
+        hr_vals  = df_raw.loc[df_raw["itemid"] == 220045, "value"].dropna()
+        hr_valid = len(hr_vals) > 0
+        mean_hr  = self._zscore(float(hr_vals.mean()), 220045) if hr_valid else 0.0
+
+        any_vaso = float(df_raw["itemid"].isin(VASOPRESSOR_ITEMIDS).any())
+
+        lac      = df_raw.loc[df_raw["itemid"].isin(LACTATE_ITEMIDS), "value"].dropna()
+        ph       = df_raw.loc[df_raw["itemid"] == PH_ITEMID,          "value"].dropna()
+        any_crit = float(
+            (len(lac) > 0 and float(lac.max()) > 4.0)
+            or (len(ph) > 0 and float(ph.min()) < 7.25)
+        )
+
+        proxy_targets_arr = np.array([log_count, mean_hr, any_vaso, any_crit], dtype=np.float32)
+        proxy_mask_arr    = np.array([True, hr_valid, True, True],             dtype=bool)
+
+        # ── 6. Build model input from the input window ────────────────────────
         df = df_input_events.copy()
         df["source"] = df["source"].map(SOURCE_MAP).fillna(0).astype(int)
         df = df[["delta_hours", "source", "itemid", "value"]].fillna(0)
 
-        # ── 5. Value bins (from raw values, before Z-scoring) ─────────────────
+        # ── 7. Value bins (from raw values, before Z-scoring) ─────────────────
         df["value_bin"] = [
             self._to_value_bin(float(v), int(iid))
             for v, iid in zip(df["value"].values, df["itemid"].values)
         ]
 
-        # ── 6. Z-score normalise values ───────────────────────────────────────
+        # ── 8. Z-score normalise values ───────────────────────────────────────
         df["value"] = [
             self._zscore(float(v), int(iid))
             for v, iid in zip(df["value"].values, df["itemid"].values)
         ]
 
-        # ── 7. Map raw itemids to vocab token indices ─────────────────────────
+        # ── 9. Map raw itemids to vocab token indices ─────────────────────────
         df["itemid"] = [self._to_token_idx(int(iid)) for iid in df["itemid"].values]
 
-        # ── 8. Window selection for long input sequences ──────────────────────
+        # ── 10. Window selection for long input sequences ─────────────────────
         #    budget = max_len - 1  (one slot reserved for [CLS])
         budget = self.max_len - 1
         if len(df) > budget:
@@ -184,14 +214,14 @@ class ICUDataset(Dataset):
             else:  # "last" — most recent events, closer to outcome
                 df = df.iloc[-budget:].reset_index(drop=True)
 
-        # ── 9. Prepend [CLS] at position 0 ───────────────────────────────────
+        # ── 11. Prepend [CLS] at position 0 ──────────────────────────────────
         cls_row = pd.DataFrame(
             [[0.0, 0, CLS_TOKEN_ID, 0.0, 0]],
             columns=["delta_hours", "source", "itemid", "value", "value_bin"],
         )
         df = pd.concat([cls_row, df], ignore_index=True)
 
-        # ── 10. Pad to max_len ────────────────────────────────────────────────
+        # ── 12. Pad to max_len ────────────────────────────────────────────────
         n = len(df)
         if n < self.max_len:
             pad_count = self.max_len - n
@@ -204,7 +234,7 @@ class ICUDataset(Dataset):
         else:
             mask = [True] * self.max_len
 
-        # ── 11. Build input tensors ───────────────────────────────────────────
+        # ── 13. Build input tensors ───────────────────────────────────────────
         inputs = {
             "itemid"      : torch.tensor(df["itemid"].values,      dtype=torch.long),
             "source"      : torch.tensor(df["source"].values,      dtype=torch.long),
@@ -214,14 +244,16 @@ class ICUDataset(Dataset):
             "padding_mask": torch.tensor(mask,                     dtype=torch.bool),
         }
 
-        # ── 12. Build label dict ──────────────────────────────────────────────
+        # ── 14. Build label dict ──────────────────────────────────────────────
         labels = {
             "hospital_expire_flag": int(row["hospital_expire_flag"]),
             "los"                 : float(row["los"]),
             "age"                 : int(row["age"]),
             "gender"              : 0 if row["gender"] == "M" else 1,
-            "vital_targets"       : torch.tensor(vital_targets, dtype=torch.float32),
-            "vital_mask"          : torch.tensor(vital_mask,    dtype=torch.bool),
+            "vital_targets"       : torch.tensor(vital_targets,     dtype=torch.float32),
+            "vital_mask"          : torch.tensor(vital_mask,        dtype=torch.bool),
+            "proxy_targets"       : torch.tensor(proxy_targets_arr, dtype=torch.float32),
+            "proxy_mask"          : torch.tensor(proxy_mask_arr,    dtype=torch.bool),
         }
 
         return inputs, labels

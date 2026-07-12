@@ -179,6 +179,75 @@ def apply_random_mask(
     return masked_inputs, itemid_labels, value_bin_labels
 
 
+# ── ICU-specific augmentation for VICReg ─────────────────────────────────────
+
+# Matches PAD_TOKEN_ID in dataloader.py and ModelConfig.pad_token_id
+_PAD_TOKEN_ID = 0
+
+
+def augment(
+    inputs     : dict,
+    drop_p     : float = 0.15,   # event dropout probability
+    val_sigma  : float = 0.10,   # std of value jitter (in Z-score units)
+    time_sigma : float = 0.50,   # std of timing jitter (in hours)
+) -> dict:
+    """
+    ICU-specific data augmentation for VICReg.
+
+    Perturbs only NUISANCE factors while preserving the clinical state:
+
+        Event dropout  — randomly removes events (pad_p=0.15).  Models the fact
+                         that different nurses may chart different subsets of the
+                         same underlying physiology.
+
+        Value jitter   — adds small Gaussian noise to Z-scored values.  Models
+                         routine measurement noise (e.g., HR ±3 bpm).
+
+        Timing jitter  — adds small Gaussian noise to delta_hours.  Models minor
+                         charting delays (e.g., a note entered 30 min late).
+
+    What is intentionally NOT done:
+        - Large temporal crops (different time windows of the same stay) would
+          force the model to treat a patient at admission and near death as
+          equivalent — destroying exactly the clinical trajectory signal that
+          downstream tasks depend on.
+        - Token replacement ([MASK]) would corrupt the sequence semantics.
+          apply_random_mask() is for MEM pretraining, NOT for VICReg augmentation.
+
+    [CLS] (position 0) is never modified.
+    [PAD] positions are never modified.
+    """
+    itemid = inputs["itemid"].clone()
+    source = inputs["source"].clone()
+    delta  = inputs["delta_hours"].clone()
+    value  = inputs["value"].clone()
+    mask   = inputs["padding_mask"].clone()
+
+    # Eligible: real events excluding [CLS]
+    eligible       = mask.clone()
+    eligible[:, 0] = False
+
+    # Event dropout: remove event entirely (set to PAD, zero value)
+    drop = eligible & (torch.rand_like(value) < drop_p)
+    itemid[drop] = _PAD_TOKEN_ID
+    value[drop]  = 0.0
+    mask[drop]   = False
+
+    # Value jitter on surviving real events
+    keep = eligible & ~drop
+    value[keep] = value[keep] + torch.randn_like(value[keep]) * val_sigma
+
+    # Timing jitter on surviving real events (clamp to non-negative hours)
+    delta[keep] = (
+        delta[keep] + torch.randn_like(delta[keep]) * time_sigma
+    ).clamp(min=0.0)
+
+    out = dict(inputs)
+    out.update({"itemid": itemid, "source": source,
+                "delta_hours": delta, "value": value, "padding_mask": mask})
+    return out
+
+
 # ── VICReg contrastive loss ────────────────────────────────────────────────────
 
 def vicreg_loss(
@@ -212,16 +281,18 @@ def vicreg_loss(
     std_z2 = torch.sqrt(z2.var(dim=0) + 1e-4)
     var_loss = (F.relu(1.0 - std_z1).mean() + F.relu(1.0 - std_z2).mean()) / 2
 
-    # Covariance: off-diagonal elements of the normalised covariance should be 0
+    # Covariance: off-diagonal elements of normalised covariance → 0
+    # Divide by D (not D²) to keep gradient scale comparable across dimensions.
     z1_c = z1 - z1.mean(dim=0)
     z2_c = z2 - z2.mean(dim=0)
     cov_z1 = (z1_c.T @ z1_c) / (N - 1)
     cov_z2 = (z2_c.T @ z2_c) / (N - 1)
 
-    eye = torch.eye(D, device=z1.device, dtype=torch.bool)
-    cov_loss = (
-        cov_z1[~eye].pow(2).sum() / D
-        + cov_z2[~eye].pow(2).sum() / D
-    ) / 2
+    def _off_diag_loss(cov):
+        # Zero out diagonal, then penalise remaining elements
+        off = cov - torch.diag(torch.diag(cov))
+        return off.pow(2).sum() / D
+
+    cov_loss = (_off_diag_loss(cov_z1) + _off_diag_loss(cov_z2)) / 2
 
     return mu * sim_loss + lambda_ * var_loss + nu * cov_loss
