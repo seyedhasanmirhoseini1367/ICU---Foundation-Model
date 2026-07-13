@@ -1,6 +1,10 @@
 """
 kaggle_run.py - Full ICU Foundation Model pipeline for Kaggle
 
+Runs both branches end-to-end:
+  Branch A (MEM) : bidirectional masked encoder → pretrain → fine-tune
+  Branch B (AR)  : causal autoregressive decoder → pretrain → zero-shot eval
+
 Copy this file into a Kaggle notebook and run each cell block in order,
 OR run the whole file at once:
 
@@ -11,7 +15,11 @@ Prerequisites in Kaggle:
   2. Add secret:      WANDB_API_KEY           (Notebook -> Add-ons -> Secrets)
   3. Enable GPU:      Accelerator -> GPU T4 x1
 
-Expected total runtime: ~4-6 hours on T4 GPU
+Expected total runtime: ~3-4 hours on T4 GPU
+  Branch A pretrain  : ~50-90 min
+  Branch A fine-tune : ~20-40 min
+  Branch B pretrain  : ~50-90 min
+  Branch B eval      : ~10-15 min
 """
 
 import os, sys, subprocess
@@ -297,20 +305,111 @@ subprocess.run(
 )
 
 # ==============================================================================
-# -- CELL 9 . Summary
+# -- CELL 9 . Branch B — AR pretraining
+# ==============================================================================
+#
+# Trains ICUAutoregressiveModel with next-event prediction (causal LM).
+# Uses the same stays, vocab, and norm stats as Branch A.
+# time_bin_edges.json was built in CELL 6 alongside the other tokenizer files.
+# ~50-90 min on T4; early stopping with patience=3.
+# ------------------------------------------------------------------------------
+
+AR_CKPT_DIR = WORK / "checkpoints" / "ar"
+
+subprocess.run(
+    [
+        sys.executable, str(WORK / "training" / "pretrain_ar.py"),
+        "--index",     str(INDEX_PATH),
+        "--data_dir",  str(STAYS_DIR),
+        "--vocab",     str(WORK / "tokenizer" / "vocab.json"),
+        "--norm",      str(WORK / "tokenizer" / "norm_stats.json"),
+        "--bins",      str(WORK / "tokenizer" / "bin_edges.json"),
+        "--time_bins", str(WORK / "tokenizer" / "time_bin_edges.json"),
+        "--out",       str(AR_CKPT_DIR),
+        "--epochs",    "10",
+        "--batch",     "32",
+        "--lr",        "3e-4",
+        "--patience",  "3",
+        "--workers",   "2",          # Kaggle runs Linux — parallel data loading is safe
+        "--wandb_project", "MIMIC-IV-ICU-AR",
+    ],
+    env={**os.environ,
+         "USE_WANDB":  os.environ.get("USE_WANDB", "0"),
+         "PYTHONPATH": str(WORK)},
+    check=True,
+)
+
+# ==============================================================================
+# -- CELL 10 . Branch B — zero-shot evaluation
+# ==============================================================================
+#
+# Evaluates the AR model without any fine-tuning (zero-shot):
+#   • Next-event top-1 accuracy  split by new-onset vs. repeat events
+#   • Mortality AUROC + Brier score via rollout (n_rollout=50 trajectories)
+#   • Head-to-head comparison table with Branch A (MEM) fine-tuned model
+#
+# Uses the validation split created by pretrain_ar.py so there is no leakage.
+# ~10-15 min on T4 (200 stays × 50 rollout trajectories).
+# ------------------------------------------------------------------------------
+
+import torch as _torch   # may not be imported yet if SKIP_INIT was set
+
+_ar_best  = AR_CKPT_DIR / "ar_best.pt"
+_val_idx  = AR_CKPT_DIR / "val_index.csv"   # written by pretrain_ar.py
+_mem_best = WORK / "checkpoints" / "finetune" / "best.pt"
+
+if _ar_best.exists():
+    _eval_cmd = [
+        sys.executable, str(WORK / "evaluation" / "eval_ar.py"),
+        "--ar_ckpt",   str(_ar_best),
+        "--index",     str(_val_idx if _val_idx.exists() else INDEX_PATH),
+        "--data_dir",  str(STAYS_DIR),
+        "--vocab",     str(WORK / "tokenizer" / "vocab.json"),
+        "--norm",      str(WORK / "tokenizer" / "norm_stats.json"),
+        "--bins",      str(WORK / "tokenizer" / "bin_edges.json"),
+        "--time_bins", str(WORK / "tokenizer" / "time_bin_edges.json"),
+        "--n_rollout", "50",
+        "--horizon",   "6.0",
+        "--max_stays", "200",
+    ]
+    if _mem_best.exists():
+        _eval_cmd += ["--mem_ckpt", str(_mem_best)]
+
+    subprocess.run(
+        _eval_cmd,
+        env={**os.environ, "PYTHONPATH": str(WORK)},
+        check=True,
+    )
+else:
+    print("AR best checkpoint not found — skipping eval_ar.py")
+
+# ==============================================================================
+# -- CELL 11 . Summary
 # ==============================================================================
 
 pretrain_ckpt = WORK / "checkpoints" / "pretrain" / "best.pt"
 finetune_ckpt = WORK / "checkpoints" / "finetune" / "best.pt"
+ar_ckpt       = AR_CKPT_DIR / "ar_best.pt"
 
-for ckpt in [pretrain_ckpt, finetune_ckpt]:
+print("\n── Branch A (MEM) ───────────────────────────────────────────────────")
+for label, ckpt in [("pretrain/best.pt", pretrain_ckpt), ("finetune/best.pt", finetune_ckpt)]:
     if ckpt.exists():
-        meta = torch.load(ckpt, map_location="cpu")
-        print(f"\n{ckpt.parent.name}/best.pt")
-        print(f"  epoch : {meta['epoch']}")
-        print(f"  loss  : {meta['loss']:.4f}")
+        meta = _torch.load(ckpt, map_location="cpu")
+        print(f"  {label}")
+        print(f"    epoch : {meta.get('epoch', '?')}")
+        print(f"    loss  : {meta.get('loss', float('nan')):.4f}")
     else:
-        print(f"\n{ckpt} - not found")
+        print(f"  {label} — not found")
 
-print(f"\nAll done OK")
-print(f"wandb: https://wandb.ai/seyedhasan-mirhoseini1367-tampere-university/MIMIC-IV-ICU")
+print("\n── Branch B (AR) ────────────────────────────────────────────────────")
+if ar_ckpt.exists():
+    meta = _torch.load(ar_ckpt, map_location="cpu")
+    print(f"  ar/ar_best.pt")
+    print(f"    epoch    : {meta.get('epoch', '?')}")
+    print(f"    val_loss : {meta.get('val_loss', float('nan')):.4f}")
+else:
+    print("  ar/ar_best.pt — not found")
+
+print(f"\nAll done.")
+print(f"Branch A wandb : https://wandb.ai/seyedhasan-mirhoseini1367-tampere-university/MIMIC-IV-ICU")
+print(f"Branch B wandb : https://wandb.ai/seyedhasan-mirhoseini1367-tampere-university/MIMIC-IV-ICU-AR")
