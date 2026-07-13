@@ -187,3 +187,51 @@ class ProxyHead(nn.Module):
 
     def forward(self, cls_output: torch.Tensor) -> torch.Tensor:
         return self.head(cls_output)   # [B, N_PROXY_TARGETS]
+
+
+class NextEventHead(nn.Module):
+    """
+    Branch B autoregressive head: predicts the NEXT event at every position.
+
+    Given the hidden state at position t, predicts three things about event t+1:
+        - itemid_logits : which item/measurement comes next  [B, L, vocab_size]
+        - value_logits  : which decile bin its value falls in [B, L, n_value_bins]
+        - delta_logits  : how many hours until the next event  [B, L, n_time_bins]
+
+    The training loop slices away the last position (predictions) and first
+    position (targets) to form the causal alignment:
+        predictions: model(inputs)[:, :-1]   from positions 0 … L-2
+        targets    : inputs[:, 1:]           events   1 … L-1
+    """
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+
+        # Shared bottleneck: compress before each prediction branch
+        hidden = config.d_model // 2
+
+        self.itemid_head = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model),
+            nn.GELU(),
+            nn.LayerNorm(config.d_model),
+            nn.Linear(config.d_model, config.vocab_size),
+        )
+        self.value_head = nn.Sequential(
+            nn.Linear(config.d_model, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, config.n_value_bins),
+        )
+        self.delta_head = nn.Sequential(
+            nn.Linear(config.d_model, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, config.n_time_bins),
+        )
+
+    def forward(
+        self,
+        sequence_output: torch.Tensor,  # [B, L, d_model]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        itemid_logits = self.itemid_head(sequence_output)  # [B, L, vocab_size]
+        value_logits  = self.value_head(sequence_output)   # [B, L, n_value_bins]
+        delta_logits  = self.delta_head(sequence_output)   # [B, L, n_time_bins]
+        return itemid_logits, value_logits, delta_logits

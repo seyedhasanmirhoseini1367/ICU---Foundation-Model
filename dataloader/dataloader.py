@@ -58,6 +58,8 @@ class ICUDataset(Dataset):
         delta_hours   FloatTensor   hours since ICU admission (0 for [CLS]/[PAD])
         value         FloatTensor   Z-scored measurement value (0 for [CLS]/[PAD])
         value_bins    LongTensor    per-itemid decile bin index 0-9 (for pretrain)
+        delta_bins    LongTensor    global time-gap bin for gap from pos i to i+1
+                                    (only present when time_bin_edges_path is given)
         padding_mask  BoolTensor    True=real event, False=padding
 
     labels — plain Python dict (collated into tensors by DataLoader):
@@ -73,13 +75,14 @@ class ICUDataset(Dataset):
 
     def __init__(
         self,
-        index_path       : str | Path,
-        data_dir         : str | Path,
-        vocab_path       : str | Path | None = None,
-        norm_stats_path  : str | Path | None = None,
-        bin_edges_path   : str | Path | None = None,
-        max_len          : int  = 512,
-        window_mode      : str  = "last",   # "last" or "random"
+        index_path           : str | Path,
+        data_dir             : str | Path,
+        vocab_path           : str | Path | None = None,
+        norm_stats_path      : str | Path | None = None,
+        bin_edges_path       : str | Path | None = None,
+        time_bin_edges_path  : str | Path | None = None,  # Branch B: global gap bins
+        max_len              : int  = 512,
+        window_mode          : str  = "last",   # "last" or "random"
     ):
         self.index       = pd.read_csv(index_path)
         self.data_dir    = Path(data_dir)
@@ -100,6 +103,11 @@ class ICUDataset(Dataset):
         if bin_edges_path is not None:
             with open(bin_edges_path) as f:
                 self.bin_edges = json.load(f)
+
+        self.time_bin_edges = None   # flat list of 9 floats (global gap quantile edges)
+        if time_bin_edges_path is not None:
+            with open(time_bin_edges_path) as f:
+                self.time_bin_edges = json.load(f)
             # Warn if many vocab items lack decile edges (will always get bin 0)
             if self.vocab is not None:
                 n_real = sum(1 for k in self.vocab if k not in {"[PAD]","[MASK]","[CLS]","[UNK]"})
@@ -132,6 +140,28 @@ class ICUDataset(Dataset):
         if stats is None:
             return 0.0
         return (raw_value - stats["mean"]) / stats["std"]
+
+    def _to_delta_bin_vec(
+        self,
+        delta_hours_arr : np.ndarray,   # [L]  float64
+        mask_arr        : np.ndarray,   # [L]  bool
+    ) -> np.ndarray:                    # [L]  int64
+        """Compute per-position global time-gap bin.
+
+        gap[i] = delta_hours[i+1] - delta_hours[i]  where both i and i+1 are real.
+        gap for the last real event and all PAD positions = 0 → bin 0.
+        """
+        L    = len(delta_hours_arr)
+        bins = np.zeros(L, dtype=np.int64)
+        if self.time_bin_edges is None:
+            return bins
+
+        edges     = np.asarray(self.time_bin_edges, dtype=np.float64)
+        both_real = mask_arr[:-1] & mask_arr[1:]              # [L-1]
+        raw_gaps  = np.diff(delta_hours_arr.astype(np.float64))  # [L-1]
+        gaps      = np.where(both_real, np.maximum(raw_gaps, 0.0), 0.0)
+        bins[:-1] = np.searchsorted(edges, gaps)
+        return bins
 
     def _to_value_bin(self, raw_value: float, raw_itemid: int) -> int:
         """Map a raw measurement value to its per-itemid decile bin (0 to n_bins-1).
@@ -247,14 +277,22 @@ class ICUDataset(Dataset):
             mask = [True] * self.max_len
 
         # ── 13. Build input tensors ───────────────────────────────────────────
+        mask_arr = np.array(mask, dtype=bool)
         inputs = {
             "itemid"      : torch.tensor(df["itemid"].values,      dtype=torch.long),
             "source"      : torch.tensor(df["source"].values,      dtype=torch.long),
             "delta_hours" : torch.tensor(df["delta_hours"].values, dtype=torch.float32),
             "value"       : torch.tensor(df["value"].values,       dtype=torch.float32),
             "value_bins"  : torch.tensor(df["value_bin"].values,   dtype=torch.long),
-            "padding_mask": torch.tensor(mask,                     dtype=torch.bool),
+            "padding_mask": torch.tensor(mask_arr,                 dtype=torch.bool),
         }
+
+        # delta_bins: included only when time_bin_edges were loaded (Branch B)
+        if self.time_bin_edges is not None:
+            delta_bin_arr = self._to_delta_bin_vec(
+                df["delta_hours"].values, mask_arr
+            )
+            inputs["delta_bins"] = torch.tensor(delta_bin_arr, dtype=torch.long)
 
         # ── 14. Build label dict ──────────────────────────────────────────────
         labels = {
@@ -274,16 +312,17 @@ class ICUDataset(Dataset):
 # ── Convenience factory ───────────────────────────────────────────────────────
 
 def make_dataloader(
-    index_path       : str | Path,
-    data_dir         : str | Path,
-    vocab_path       : str | Path | None = None,
-    norm_stats_path  : str | Path | None = None,
-    bin_edges_path   : str | Path | None = None,
-    max_len          : int  = 512,
-    batch_size       : int  = 16,
-    shuffle          : bool = True,
-    num_workers      : int  = 0,
-    window_mode      : str  = "last",
+    index_path           : str | Path,
+    data_dir             : str | Path,
+    vocab_path           : str | Path | None = None,
+    norm_stats_path      : str | Path | None = None,
+    bin_edges_path       : str | Path | None = None,
+    time_bin_edges_path  : str | Path | None = None,
+    max_len              : int  = 512,
+    batch_size           : int  = 16,
+    shuffle              : bool = True,
+    num_workers          : int  = 0,
+    window_mode          : str  = "last",
 ) -> DataLoader:
     dataset = ICUDataset(
         index_path=index_path,
@@ -291,6 +330,7 @@ def make_dataloader(
         vocab_path=vocab_path,
         norm_stats_path=norm_stats_path,
         bin_edges_path=bin_edges_path,
+        time_bin_edges_path=time_bin_edges_path,
         max_len=max_len,
         window_mode=window_mode,
     )

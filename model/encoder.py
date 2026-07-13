@@ -49,22 +49,32 @@ class TransformerEncoderLayer(nn.Module):
 
     def forward(
         self,
-        x            : torch.Tensor,        # [B, L, d_model]
-        padding_mask : torch.Tensor | None, # [B, L]  True=real event, False=pad
-    ) -> torch.Tensor:                      # [B, L, d_model]
-
+        x            : torch.Tensor,              # [B, L, d_model]
+        padding_mask : torch.Tensor | None,       # [B, L]  True=real, False=pad
+        attn_mask    : torch.Tensor | None = None, # [L, L] BoolTensor  True=block
+    ) -> torch.Tensor:                            # [B, L, d_model]
+        """
+        attn_mask (optional): additive attention mask applied inside MultiheadAttention.
+            - If None (default): full bidirectional attention (Branch A, MEM encoder).
+            - If BoolTensor [L, L], True positions are blocked (cannot attend to).
+              Pass torch.triu(ones(L,L), diagonal=1) for causal left-to-right attention
+              (Branch B, AR decoder).
+        Both attn_mask and key_padding_mask are passed independently to MHA and
+        are ANDed together (either blocking mechanism overrides).
+        """
         # nn.MultiheadAttention uses True = IGNORE in key_padding_mask,
         # which is the opposite of our convention (True = real event).
         attn_key_mask = ~padding_mask if padding_mask is not None else None
 
         # Pre-LN attention sublayer with residual connection
-        normed    = self.norm_attn(x)
+        normed      = self.norm_attn(x)
         attn_out, _ = self.attention(
             query=normed,
             key=normed,
             value=normed,
             key_padding_mask=attn_key_mask,
-            need_weights=False,             # skip attention weight storage
+            attn_mask=attn_mask,            # None for Branch A; causal mask for Branch B
+            need_weights=False,
         )
         x = x + attn_out
 
@@ -90,11 +100,12 @@ class TransformerEncoder(nn.Module):
 
     def forward(
         self,
-        x            : torch.Tensor,        # [B, L, d_model]
-        padding_mask : torch.Tensor | None, # [B, L]
-    ) -> torch.Tensor:                      # [B, L, d_model]
+        x            : torch.Tensor,              # [B, L, d_model]
+        padding_mask : torch.Tensor | None,       # [B, L]
+        attn_mask    : torch.Tensor | None = None, # [L, L] BoolTensor; see layer docstring
+    ) -> torch.Tensor:                            # [B, L, d_model]
 
         for layer in self.layers:
-            x = layer(x, padding_mask)
+            x = layer(x, padding_mask, attn_mask)
 
         return self.final_norm(x)

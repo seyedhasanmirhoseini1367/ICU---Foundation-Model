@@ -71,6 +71,27 @@ class ModelConfig:
     # ── Reproducibility ──────────────────────────────────────────────────────
     random_seed : int = 42
 
+    # ── Autoregressive Branch B ───────────────────────────────────────────────
+    # Time-gap binning: global decile bins for the Δt gap between consecutive
+    # events.  Mirrors n_value_bins but is global (not per-itemid) because
+    # per-itemid gap distributions would be too sparse.
+    n_time_bins         : int   = 10     # decile bins for time gaps (0–9)
+
+    # AR next-event loss: weighted mean of three CE terms.
+    # Equal weights (1.0) by default — tune if one term dominates.
+    ar_itemid_weight    : float = 1.0    # CE weight for itemid prediction
+    ar_value_weight     : float = 1.0    # CE weight for value_bin prediction
+    ar_delta_weight     : float = 1.0    # CE weight for delta_bin prediction
+
+    # Rollout defaults (inference/rollout.py)
+    # horizon_hours is capped to prevent error accumulation in long rollouts.
+    # max_events is a hard safety cap independent of horizon.
+    rollout_horizon_hours : float = 6.0   # default simulation horizon (hours)
+    rollout_max_events    : int   = 200   # hard cap on sampled events per trajectory
+    rollout_top_k         : int   = 0     # restrict to top-k tokens (0 = pure sampling)
+    rollout_temperature   : float = 1.0   # logit scale before softmax (1.0 = unchanged)
+    rollout_n_samples     : int   = 50    # default number of trajectories per stay
+
     def __post_init__(self):
         assert self.d_model % self.n_heads == 0, (
             f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads}). "

@@ -43,9 +43,13 @@ BIN_EDGES_PATH = OUT_DIR / "bin_edges.json"
 SPECIAL_TOKENS = {"[PAD]": 0, "[MASK]": 1, "[CLS]": 2, "[UNK]": 3}
 FIRST_REAL_IDX = len(SPECIAL_TOKENS)   # real itemids start at 4
 
-# Quantile binning
-N_VALUE_BINS  = 10     # decile bins per itemid
-MAX_RESERVOIR = 10_000 # reservoir size per itemid (avoids OOM on large datasets)
+# Quantile binning — per-itemid (value) and global (time gaps)
+N_VALUE_BINS      = 10       # decile bins per itemid for measurement values
+MAX_RESERVOIR     = 10_000   # reservoir size per itemid
+N_TIME_BINS       = 10       # decile bins for inter-event time gaps (global)
+MAX_TIME_RESERVOIR = 200_000 # global gap reservoir (avoids OOM on very large datasets)
+
+TIME_BIN_EDGES_PATH = OUT_DIR / "time_bin_edges.json"
 
 
 # ── Core functions ────────────────────────────────────────────────────────────
@@ -124,6 +128,51 @@ def build_norm_stats(value_accum: dict) -> dict:
     return norm_stats
 
 
+def collect_time_gaps(stay_files: list[Path]) -> list:
+    """
+    Reservoir-sample inter-event time gaps across all stays.
+
+    gap[i] = delta_hours[i+1] - delta_hours[i] for consecutive events i, i+1
+    within the same stay.  Gaps are global (not per-itemid) because per-itemid
+    gap distributions would be too sparse for reliable quantile estimation.
+    """
+    samples: list[float] = []
+    rng   = random.Random(42)
+    total = 0
+
+    for path in stay_files:
+        df = pd.read_csv(path, usecols=["delta_hours"])
+        dh = pd.to_numeric(df["delta_hours"], errors="coerce").dropna().values
+        if len(dh) < 2:
+            continue
+        gaps = np.diff(dh)
+        gaps = gaps[gaps >= 0.0]   # guard against reversed timestamps
+        for gap in gaps:
+            total += 1
+            if len(samples) < MAX_TIME_RESERVOIR:
+                samples.append(float(gap))
+            else:
+                j = rng.randint(0, total - 1)
+                if j < MAX_TIME_RESERVOIR:
+                    samples[j] = float(gap)
+
+    return samples
+
+
+def build_time_bin_edges(gap_samples: list) -> list:
+    """
+    Compute 9 global decile edges from reservoir-sampled inter-event gaps.
+    Returns a flat list of 9 floats: [e1, ..., e9].
+    9 edges define 10 bins: [0, e1), [e1, e2), ..., [e9, ∞).
+    """
+    if len(gap_samples) < N_TIME_BINS:
+        return []
+    arr         = np.array(gap_samples, dtype=np.float32)
+    percentiles = np.linspace(0, 100, N_TIME_BINS + 1)[1:-1]   # 10, 20, …, 90
+    edges       = np.percentile(arr, percentiles).tolist()
+    return [round(float(e), 6) for e in edges]
+
+
 def build_bin_edges(value_samples: dict) -> dict:
     """
     Computes per-itemid decile edges from the reservoir-sampled values.
@@ -160,14 +209,19 @@ def main():
     print(f"Scanning {len(stay_files)} stay files in {STAYS_DIR} ...")
     itemid_set, value_accum, value_samples = collect_stats(stay_files)
 
-    vocab      = build_vocab(itemid_set)
-    norm_stats = build_norm_stats(value_accum)
-    bin_edges  = build_bin_edges(value_samples)
+    print("Building time-gap statistics ...")
+    gap_samples = collect_time_gaps(stay_files)
+
+    vocab           = build_vocab(itemid_set)
+    norm_stats      = build_norm_stats(value_accum)
+    bin_edges       = build_bin_edges(value_samples)
+    time_bin_edges  = build_time_bin_edges(gap_samples)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    VOCAB_PATH.write_text(json.dumps(vocab,      indent=2))
-    NORM_PATH.write_text(json.dumps(norm_stats,  indent=2))
-    BIN_EDGES_PATH.write_text(json.dumps(bin_edges, indent=2))
+    VOCAB_PATH.write_text(json.dumps(vocab,          indent=2))
+    NORM_PATH.write_text(json.dumps(norm_stats,      indent=2))
+    BIN_EDGES_PATH.write_text(json.dumps(bin_edges,  indent=2))
+    TIME_BIN_EDGES_PATH.write_text(json.dumps(time_bin_edges))
 
     n_real_vocab = len(vocab) - FIRST_REAL_IDX
     n_with_edges = sum(1 for v in bin_edges.values() if v)
@@ -182,9 +236,12 @@ def main():
     if n_no_edges:
         print(f"           : {n_no_edges} itemids ({100-pct_covered:.1f}%) always map to "
               f"bin 0 — these have < {N_VALUE_BINS} distinct values in the dataset")
+    print(f"Time bins  : {len(time_bin_edges)} edges from {len(gap_samples)} gap samples  "
+          f"→ {N_TIME_BINS} global time bins")
     print(f"\nSaved → {VOCAB_PATH}")
     print(f"Saved → {NORM_PATH}")
     print(f"Saved → {BIN_EDGES_PATH}")
+    print(f"Saved → {TIME_BIN_EDGES_PATH}")
 
 
 if __name__ == "__main__":
