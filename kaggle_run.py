@@ -274,35 +274,42 @@ subprocess.run(
 )
 
 # ==============================================================================
-# -- CELL 7 . Pre-training (Masked Event Modeling)
+# -- CELL 7 . Pre-training (Masked Event Modeling)  [Branch A]
 # ==============================================================================
 #
+# Set SKIP_BRANCH_A=1 to skip cells 7-8 when Branch A checkpoints already exist.
 # ~1-2 hours on T4 for 65k stays (50-epoch budget, early stop at ~43).
 # Watch live at:  https://wandb.ai/seyedhasan-mirhoseini1367-tampere-university/MIMIC-IV-ICU
 # ------------------------------------------------------------------------------
 
-subprocess.run(
-    [sys.executable, str(WORK / "training" / "pretrain.py")],
-    env={**os.environ,
-         "USE_WANDB":   os.environ.get("USE_WANDB", "0"),
-         "PYTHONPATH":  str(WORK)},
-    check=True,
-)
+SKIP_BRANCH_A = os.environ.get("SKIP_BRANCH_A", "0") == "1"
+
+if SKIP_BRANCH_A:
+    print("SKIP_BRANCH_A=1 — skipping Branch A pretrain + finetune (using existing checkpoints)")
+else:
+    subprocess.run(
+        [sys.executable, str(WORK / "training" / "pretrain.py")],
+        env={**os.environ,
+             "USE_WANDB":   os.environ.get("USE_WANDB", "0"),
+             "PYTHONPATH":  str(WORK)},
+        check=True,
+    )
 
 # ==============================================================================
-# -- CELL 8 . Fine-tuning (mortality + LOS)
+# -- CELL 8 . Fine-tuning (mortality + LOS)  [Branch A]
 # ==============================================================================
 #
 # ~45-90 min on T4.  Best checkpoint -> checkpoints/finetune/best.pt
 # ------------------------------------------------------------------------------
 
-subprocess.run(
-    [sys.executable, str(WORK / "training" / "finetune.py")],
-    env={**os.environ,
-         "USE_WANDB":   os.environ.get("USE_WANDB", "0"),
-         "PYTHONPATH":  str(WORK)},
-    check=True,
-)
+if not SKIP_BRANCH_A:
+    subprocess.run(
+        [sys.executable, str(WORK / "training" / "finetune.py")],
+        env={**os.environ,
+             "USE_WANDB":   os.environ.get("USE_WANDB", "0"),
+             "PYTHONPATH":  str(WORK)},
+        check=True,
+    )
 
 # ==============================================================================
 # -- CELL 9 . Branch B — AR pretraining
