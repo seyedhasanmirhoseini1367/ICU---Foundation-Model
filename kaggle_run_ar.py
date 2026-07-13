@@ -1,25 +1,26 @@
 """
-kaggle_run.py — Branch A (MEM) pipeline for Kaggle
+kaggle_run_ar.py — Branch B (AR) pipeline for Kaggle
 
-Branch A: bidirectional masked encoder
-  pretrain  →  Masked Event Modeling (MEM) + optional VICReg + proxy targets
-  finetune  →  mortality (BCE) + LOS (MSE) + vital forecast (MSE)
+Branch B: causal autoregressive decoder
+  pretrain  →  next-event prediction (itemid + value_bin + delta_bin)
+  eval      →  zero-shot mortality AUROC + next-event accuracy (new-onset vs repeat)
+               optional head-to-head table vs Branch A if finetune/best.pt exists
 
 Usage:
-    exec(open('/kaggle/working/kaggle_run.py').read())
+    exec(open('/kaggle/working/kaggle_run_ar.py').read())
 
-To run Branch B instead, use kaggle_run_ar.py.
+To run Branch A instead, use kaggle_run.py.
 
 Prerequisites:
-  1. Attach dataset:  luciadam/icu-datasets
+  1. Attach dataset:  luciadam/icu-datasets  (and optionally mimic-iv-icu-stays)
   2. Add secret:      WANDB_API_KEY
   3. Enable GPU:      T4 x1
 
-Expected runtime: ~1.5-2.5 hours on T4
-  Extract / load stays : ~5 min  (or ~9 h on first run without pre-extracted dataset)
-  Build vocab          : ~2 min
-  Branch A pretrain    : ~50-90 min
-  Branch A fine-tune   : ~20-40 min
+Expected runtime: ~1.5-2 hours on T4
+  Extract / load stays : ~5 min  (fast if stays are already extracted)
+  Build vocab          : ~2 min  (also builds time_bin_edges.json)
+  Branch B pretrain    : ~50-90 min
+  Branch B eval        : ~10-15 min
 """
 
 import os, sys, subprocess
@@ -228,7 +229,7 @@ else:
         _save_extracted_as_dataset()
 
 # ==============================================================================
-# CELL 6 — Build vocabulary & tokenizer artifacts
+# CELL 6 — Build vocabulary & tokenizer artifacts (including time_bin_edges.json)
 # ==============================================================================
 
 subprocess.run(
@@ -238,13 +239,30 @@ subprocess.run(
 )
 
 # ==============================================================================
-# CELL 7 — Branch A: MEM pretraining
+# CELL 7 — Branch B: AR pretraining
 # ==============================================================================
 # ~50-90 min on T4.
-# wandb: https://wandb.ai/seyedhasan-mirhoseini1367-tampere-university/MIMIC-IV-ICU
+# wandb: https://wandb.ai/seyedhasan-mirhoseini1367-tampere-university/MIMIC-IV-ICU-AR
+
+AR_CKPT_DIR = WORK / "checkpoints" / "ar"
 
 subprocess.run(
-    [sys.executable, str(WORK / "training" / "pretrain.py")],
+    [
+        sys.executable, str(WORK / "training" / "pretrain_ar.py"),
+        "--index",     str(INDEX_PATH),
+        "--data_dir",  str(STAYS_DIR),
+        "--vocab",     str(WORK / "tokenizer" / "vocab.json"),
+        "--norm",      str(WORK / "tokenizer" / "norm_stats.json"),
+        "--bins",      str(WORK / "tokenizer" / "bin_edges.json"),
+        "--time_bins", str(WORK / "tokenizer" / "time_bin_edges.json"),
+        "--out",       str(AR_CKPT_DIR),
+        "--epochs",    "10",
+        "--batch",     "32",
+        "--lr",        "3e-4",
+        "--patience",  "3",
+        "--workers",   "2",
+        "--wandb_project", "MIMIC-IV-ICU-AR",
+    ],
     env={**os.environ,
          "USE_WANDB":  os.environ.get("USE_WANDB", "0"),
          "PYTHONPATH": str(WORK)},
@@ -252,17 +270,40 @@ subprocess.run(
 )
 
 # ==============================================================================
-# CELL 8 — Branch A: fine-tuning (mortality + LOS + vital forecast)
+# CELL 8 — Branch B: zero-shot evaluation
 # ==============================================================================
-# ~20-40 min on T4.  Best checkpoint → checkpoints/finetune/best.pt
+# ~10-15 min on T4  (200 stays × 50 rollout trajectories).
+# Includes head-to-head table vs Branch A if finetune/best.pt exists.
 
-subprocess.run(
-    [sys.executable, str(WORK / "training" / "finetune.py")],
-    env={**os.environ,
-         "USE_WANDB":  os.environ.get("USE_WANDB", "0"),
-         "PYTHONPATH": str(WORK)},
-    check=True,
-)
+_ar_best  = AR_CKPT_DIR / "ar_best.pt"
+_val_idx  = AR_CKPT_DIR / "val_index.csv"
+_mem_best = WORK / "checkpoints" / "finetune" / "best.pt"
+
+if _ar_best.exists():
+    _eval_cmd = [
+        sys.executable, str(WORK / "evaluation" / "eval_ar.py"),
+        "--ar_ckpt",   str(_ar_best),
+        "--index",     str(_val_idx if _val_idx.exists() else INDEX_PATH),
+        "--data_dir",  str(STAYS_DIR),
+        "--vocab",     str(WORK / "tokenizer" / "vocab.json"),
+        "--norm",      str(WORK / "tokenizer" / "norm_stats.json"),
+        "--bins",      str(WORK / "tokenizer" / "bin_edges.json"),
+        "--time_bins", str(WORK / "tokenizer" / "time_bin_edges.json"),
+        "--n_rollout", "50",
+        "--horizon",   "6.0",
+        "--max_stays", "200",
+    ]
+    if _mem_best.exists():
+        _eval_cmd += ["--mem_ckpt", str(_mem_best)]
+        print("Branch A finetune checkpoint found — head-to-head comparison included.")
+
+    subprocess.run(
+        _eval_cmd,
+        env={**os.environ, "PYTHONPATH": str(WORK)},
+        check=True,
+    )
+else:
+    print("AR best checkpoint not found — skipping eval.")
 
 # ==============================================================================
 # CELL 9 — Summary
@@ -270,18 +311,14 @@ subprocess.run(
 
 import torch as _torch
 
-print("\n── Branch A (MEM) results ───────────────────────────────────────────")
-for label, path in [
-    ("pretrain/best.pt", WORK / "checkpoints" / "pretrain" / "best.pt"),
-    ("finetune/best.pt", WORK / "checkpoints" / "finetune" / "best.pt"),
-]:
-    if path.exists():
-        meta = _torch.load(path, map_location="cpu")
-        print(f"  {label}")
-        print(f"    epoch : {meta.get('epoch', '?')}")
-        print(f"    loss  : {meta.get('loss', float('nan')):.4f}")
-    else:
-        print(f"  {label} — not found")
+print("\n── Branch B (AR) results ────────────────────────────────────────────")
+if _ar_best.exists():
+    meta = _torch.load(_ar_best, map_location="cpu")
+    print(f"  ar/ar_best.pt")
+    print(f"    epoch    : {meta.get('epoch', '?')}")
+    print(f"    val_loss : {meta.get('val_loss', float('nan')):.4f}")
+else:
+    print("  ar/ar_best.pt — not found")
 
 print(f"\nDone.")
-print(f"wandb : https://wandb.ai/seyedhasan-mirhoseini1367-tampere-university/MIMIC-IV-ICU")
+print(f"wandb : https://wandb.ai/seyedhasan-mirhoseini1367-tampere-university/MIMIC-IV-ICU-AR")
