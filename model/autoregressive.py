@@ -102,12 +102,14 @@ if __name__ == "__main__":
     print(f"value_logits  : {list(val_logits.shape)}   (expect [{B},{L},{cfg.n_value_bins}])")
     print(f"delta_logits  : {list(dt_logits.shape)}    (expect [{B},{L},{cfg.n_time_bins}])")
 
-    # Verify causal property: perturbing position k should not change logits at pos < k
-    item_logits_2, _, _ = model(
-        itemid.clone().fill_(0).index_fill_(1, torch.tensor([L-1]), 42),
-        source, delta_hours, value, padding_mask
-    )
-    # Logits at positions 0..L-2 should be UNCHANGED (perturbation was at last position)
+    # Verify causal property: perturbing ONLY position L-1 must not change logits at 0..L-2.
+    # Clone itemid and shift the LAST position by +1 in the valid token range [4, vocab_size).
+    # All other positions remain identical to the original.
+    itemid2 = itemid.clone()
+    itemid2[:, L - 1] = (itemid2[:, L - 1] - 4 + 1) % (cfg.vocab_size - 4) + 4
+    item_logits_2, _, _ = model(itemid2, source, delta_hours, value, padding_mask)
+    # Logits at positions 0..L-2 must be UNCHANGED because those positions cannot
+    # attend to position L-1 under the causal mask.
     unchanged = torch.allclose(item_logits[:, :-1], item_logits_2[:, :-1], atol=1e-5)
     print(f"Causal check  : {'PASS' if unchanged else 'FAIL'}")
     print("Self-test complete.")

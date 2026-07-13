@@ -42,6 +42,8 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from torch.utils.data import DataLoader as _DataLoader
+
 from model.config          import ModelConfig
 from model.autoregressive  import ICUAutoregressiveModel
 from dataloader.dataloader import ICUDataset
@@ -50,12 +52,42 @@ from inference.rollout     import rollout, mortality_prob
 
 # ── Next-event accuracy (single forward pass, no rollout needed) ──────────────
 
+def _iter_stays(dataset, max_stays: int):
+    """
+    Yield (inputs_dict, labels_dict) one stay at a time from either an
+    ICUDataset (preferred) or a DataLoader (unbatched automatically).
+
+    Passing an ICUDataset is preferred because it avoids the collation overhead
+    and makes `max_stays` exact.  If a DataLoader is passed the function
+    iterates batches and unbatches them; `max_stays` is still respected.
+    """
+    if isinstance(dataset, _DataLoader):
+        count = 0
+        for batch_inputs, batch_labels in dataset:
+            B = batch_inputs["itemid"].size(0)
+            for b in range(B):
+                inp = {k: v[b] for k, v in batch_inputs.items()}
+                lbl = {
+                    k: (v[b] if isinstance(v, torch.Tensor) else
+                        (v[b] if hasattr(v, "__getitem__") else v))
+                    for k, v in batch_labels.items()
+                }
+                yield inp, lbl
+                count += 1
+                if count >= max_stays:
+                    return
+    else:
+        n = min(max_stays, len(dataset))
+        for idx in range(n):
+            yield dataset[idx]
+
+
 @torch.no_grad()
 def eval_next_event_accuracy(
-    model        : ICUAutoregressiveModel,
-    dataset      : ICUDataset,
-    device       : torch.device,
-    max_stays    : int = 500,
+    model     : ICUAutoregressiveModel,
+    dataset,  # ICUDataset  OR  torch.utils.data.DataLoader
+    device    : torch.device,
+    max_stays : int = 500,
 ) -> dict:
     """
     Computes top-1 itemid accuracy split by new-onset vs. repeat events.
@@ -65,16 +97,16 @@ def eval_next_event_accuracy(
 
     new-onset : itemid at position t+1 has NOT appeared in positions 0..t
     repeat    : itemid at position t+1 HAS appeared in positions 0..t
+
+    `dataset` accepts either an ICUDataset (indexed directly) or a DataLoader
+    (batches are automatically unbatched).  ICUDataset is preferred.
     """
     model.eval()
 
     new_onset_correct = 0;  new_onset_total = 0
     repeat_correct    = 0;  repeat_total    = 0
 
-    n = min(max_stays, len(dataset))
-    for idx in range(n):
-        inputs, _ = dataset[idx]
-
+    for inputs, _ in _iter_stays(dataset, max_stays):
         itemid       = inputs["itemid"].unsqueeze(0).to(device)      # [1, L]
         source       = inputs["source"].unsqueeze(0).to(device)
         delta_hours  = inputs["delta_hours"].unsqueeze(0).to(device)
