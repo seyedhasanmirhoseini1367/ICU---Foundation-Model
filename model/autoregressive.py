@@ -85,6 +85,7 @@ if __name__ == "__main__":
     cfg = ModelConfig(vocab_size=200, d_model=64, n_heads=4, d_ff=128, n_layers=2,
                       max_len=32, n_value_bins=10, n_time_bins=10)
     model = ICUAutoregressiveModel(cfg)
+    model.eval()   # disable dropout so both forward passes use identical masks
     print(f"ICUAutoregressiveModel: {model.count_parameters():,} parameters")
 
     B, L = 2, 32
