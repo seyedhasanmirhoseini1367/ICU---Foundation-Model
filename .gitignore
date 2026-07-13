@@ -18,6 +18,7 @@ tokenizer/bin_edges.json
 
 # Large HTML reference files (schema / handbook) — not part of the model code
 *.html
+!docs/*.html
 
 # Pretrain internal split files
 checkpoints/pretrain/_pretrain_train.csv
