@@ -16,9 +16,9 @@ tokenizer/vocab.json
 tokenizer/norm_stats.json
 tokenizer/bin_edges.json
 
-# Large HTML reference files (schema / handbook) — not part of the model code
+# Documentation / personal reference files — local only
+docs/
 *.html
-!docs/*.html
 
 # Pretrain internal split files
 checkpoints/pretrain/_pretrain_train.csv
