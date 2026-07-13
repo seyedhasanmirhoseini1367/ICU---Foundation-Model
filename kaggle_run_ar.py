@@ -44,8 +44,20 @@ if not _SKIP_INIT:
         try:
             props = torch.cuda.get_device_properties(0)
             print(f"GPU     : {props.name}  ({props.total_memory/1e9:.1f} GB VRAM)")
-        except Exception:
-            print("GPU     : available (properties unavailable)")
+            cap = torch.cuda.get_device_capability(0)
+            print(f"CUDA sm : {cap[0]}.{cap[1]}")
+            if cap[0] < 7:
+                # P100 / K80 etc. are sm_60 or below — PyTorch 2.2+ dropped support.
+                # Install a compatible build so training subprocesses use the GPU.
+                print(f"  sm_{cap[0]}{cap[1]} < sm_70: installing P100-compatible PyTorch ...")
+                subprocess.run([
+                    sys.executable, "-m", "pip", "install", "-q",
+                    "torch==2.0.1+cu118",
+                    "--extra-index-url", "https://download.pytorch.org/whl/cu118",
+                ], check=True)
+                print("  PyTorch 2.0.1+cu118 installed — training will use the P100")
+        except Exception as _gpu_e:
+            print(f"GPU     : check failed ({_gpu_e})")
 
     # ==========================================================================
     # CELL 2 — wandb authentication
@@ -98,13 +110,23 @@ INDEX_PATH     = WORK / "dataloader" / "index.csv"
 PRE_EXTRACTED  = Path("/kaggle/input/mimic-iv-icu-stays")
 STAYS_ZIP_NAME = "extracted_stays.zip"
 
+# Also check the previous kernel run's output (v10 produced a full 94k-stay zip)
+_KERNEL_OUT_ZIP = (
+    Path("/kaggle/input/icu-foundation-model-full-pipeline/_ds_upload") / STAYS_ZIP_NAME
+)
+_ZIP_PATH = (
+    PRE_EXTRACTED / STAYS_ZIP_NAME if (PRE_EXTRACTED / STAYS_ZIP_NAME).exists()
+    else _KERNEL_OUT_ZIP if _KERNEL_OUT_ZIP.exists()
+    else None
+)
+
 STAYS_DIR.mkdir(parents=True, exist_ok=True)
 
-if (PRE_EXTRACTED / STAYS_ZIP_NAME).exists():
+if _ZIP_PATH is not None:
     # ── Fast path: unzip pre-extracted stays (~5 min) ────────────────────────
     # Raw MIMIC dataset does NOT need to be attached.
-    print("Pre-extracted dataset found — unzipping ...")
-    with _zipfile.ZipFile(PRE_EXTRACTED / STAYS_ZIP_NAME) as zf:
+    print(f"Pre-extracted stays found at {_ZIP_PATH} — unzipping ...")
+    with _zipfile.ZipFile(_ZIP_PATH) as zf:
         for member in zf.namelist():
             if member.startswith("stays/"):
                 fname = Path(member).name
