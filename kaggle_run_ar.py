@@ -270,6 +270,24 @@ subprocess.run(
 
 AR_CKPT_DIR = WORK / "checkpoints" / "ar"
 
+# Auto-detect resume checkpoint from seyedhasanmirhoseini/icu-ar-checkpoint dataset
+import re as _re
+_RESUME_DATASET = Path("/kaggle/input/icu-ar-checkpoint")
+_resume_args    = []
+_start_epoch    = 0
+
+if _RESUME_DATASET.exists():
+    _ckpts = sorted(_RESUME_DATASET.glob("ar_epoch*.pt"))
+    if _ckpts:
+        _ckpt_path  = _ckpts[-1]  # highest epoch number (zero-padded names)
+        _m = _re.search(r"ar_epoch(\d+)\.pt", _ckpt_path.name)
+        if _m:
+            _start_epoch = int(_m.group(1))
+        _resume_args = ["--resume", str(_ckpt_path)]
+        print(f"Resume   : found {_ckpt_path.name}  (epoch {_start_epoch})")
+
+_total_epochs = _start_epoch + 10  # always run 10 more epochs
+
 subprocess.run(
     [
         sys.executable, str(WORK / "training" / "pretrain_ar.py"),
@@ -280,13 +298,13 @@ subprocess.run(
         "--bins",      str(WORK / "tokenizer" / "bin_edges.json"),
         "--time_bins", str(WORK / "tokenizer" / "time_bin_edges.json"),
         "--out",       str(AR_CKPT_DIR),
-        "--epochs",    "10",
+        "--epochs",    str(_total_epochs),
         "--batch",     "32",
         "--lr",        "3e-4",
         "--patience",  "3",
         "--workers",   "2",
         "--wandb_project", "MIMIC-IV-ICU-AR",
-    ],
+    ] + _resume_args,
     env={**os.environ,
          "USE_WANDB":  os.environ.get("USE_WANDB", "0"),
          "PYTHONPATH": str(WORK)},

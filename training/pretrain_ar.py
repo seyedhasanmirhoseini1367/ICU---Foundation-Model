@@ -219,6 +219,9 @@ def main():
                         help="Fraction of patients held out for validation")
     parser.add_argument("--seed",      type=int,   default=42)
     parser.add_argument("--wandb_project", default="icu-ar-pretrain")
+    parser.add_argument("--resume", default=None,
+                        help="Path to ar_epochXXX.pt checkpoint to resume from. "
+                             "--epochs is then the TOTAL epoch count (including already-done ones).")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -294,12 +297,26 @@ def main():
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    # ── Training loop ─────────────────────────────────────────────────────────
-    best_val_loss   = float("inf")
-    patience_count  = 0
-    step_offset     = 0
+    # ── Resume from checkpoint ────────────────────────────────────────────────
+    best_val_loss  = float("inf")
+    patience_count = 0
+    step_offset    = 0
+    start_epoch    = 1
 
-    for epoch in range(1, args.epochs + 1):
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch    = ckpt["epoch"] + 1
+        best_val_loss  = ckpt["val_loss"]
+        # Fast-forward cosine scheduler to the correct position
+        for _ in range(ckpt["epoch"]):
+            scheduler.step()
+        print(f"Resumed  : epoch {ckpt['epoch']}  val_loss={ckpt['val_loss']:.4f}  "
+              f"→ continuing from epoch {start_epoch} to {args.epochs}")
+
+    # ── Training loop ─────────────────────────────────────────────────────────
+    for epoch in range(start_epoch, args.epochs + 1):
         train_loss, n_steps = train_one_epoch(
             model, train_loader, optimizer, device, config,
             step_offset=step_offset, use_wandb=use_wandb,
