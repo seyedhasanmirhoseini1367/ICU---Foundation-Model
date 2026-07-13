@@ -180,22 +180,67 @@ accumulation from auto-regressive drift over long horizons.
 
 ---
 
-## Repository Structure
+## Repository Structure — Which File Belongs to Which Model
+
+### Branch A — MEM (Masked Event Modeling, bidirectional encoder)
+
+| File | Role |
+|---|---|
+| `model/embedding.py` | `ICUEventEmbedding` — shared embedding class (also used by Branch B) |
+| `model/encoder.py` | `TransformerEncoder` — shared encoder class; Branch A calls it with `attn_mask=None` (full bidirectional attention) |
+| `model/heads.py` | `PretrainHead`, `MortalityHead`, `LOSHead`, `ForecastHead`, `ProxyHead` |
+| `model/model.py` | **`ICUFoundationModel`** — the Branch A model class |
+| `training/pretrain.py` | Branch A pretraining (MEM + optional VICReg + proxy targets) |
+| `training/finetune.py` | Branch A supervised fine-tuning (mortality, LOS, vital forecast) |
+| `training/utils.py` | `apply_random_mask()`, `augment()`, `vicreg_loss()` — Branch A helpers |
+| `checkpoints/mem_best.pt` | Branch A best checkpoint |
+
+### Branch B — AR (Autoregressive Decoder, causal left-to-right)
+
+| File | Role |
+|---|---|
+| `model/autoregressive.py` | **`ICUAutoregressiveModel`** — the Branch B model class; calls `TransformerEncoder` with a causal triu mask |
+| `model/heads.py` | `NextEventHead` — added here (predicts next itemid + value_bin + delta_bin) |
+| `training/pretrain_ar.py` | Branch B pretraining (next-event prediction with correct causal shift) |
+| `inference/rollout.py` | Ancestral-sampling rollout; `mortality_prob()`, `vital_forecast()`, `event_prob()` |
+| `evaluation/eval_ar.py` | Zero-shot eval; new-onset vs. repeat accuracy split; Branch A vs B comparison table |
+| `tokenizer/time_bin_edges.json` | 9 global inter-event gap decile edges (10 time bins) — Branch B only |
+| `checkpoints/ar/ar_best.pt` | Branch B best checkpoint |
+
+### Shared (both branches read these)
+
+| File | Role |
+|---|---|
+| `model/config.py` | Single `ModelConfig` dataclass for all hyperparameters |
+| `model/embedding.py` | `ICUEventEmbedding` (both branches instantiate their own copy) |
+| `model/encoder.py` | `TransformerEncoder` (both branches instantiate their own copy; mask differs) |
+| `dataloader/dataloader.py` | `ICUDataset` / `make_dataloader` — `delta_bins` field only present when `time_bin_edges_path` is given (Branch B) |
+| `tokenizer/vocab.json` | Token vocabulary |
+| `tokenizer/norm_stats.json` | Per-itemid Z-score stats |
+| `tokenizer/bin_edges.json` | Per-itemid value decile edges |
+| `scripts/create_synthetic_stays.py` | Synthetic data generator for end-to-end testing |
 
 ```
-model/          config.py, embedding.py, encoder.py, heads.py, model.py
-                autoregressive.py          ← Branch B causal decoder
-dataloader/     extract.py, dataloader.py  (delta_bins added for Branch B)
-tokenizer/      build_vocab.py  →  vocab.json, norm_stats.json,
-                                   bin_edges.json, time_bin_edges.json
-training/       pretrain.py, finetune.py, utils.py
-                pretrain_ar.py             ← Branch B AR pretraining
-inference/      rollout.py                 ← ancestral-sampling rollout + zero-shot queries
-evaluation/     eval_ar.py                 ← zero-shot eval + Branch A vs B comparison
-scripts/        build_patient_timeline.py, fix_cell.py
-                create_synthetic_stays.py  ← synthetic data for end-to-end testing
-kaggle_run.py   full pipeline runner for Kaggle
-runner.ipynb    Kaggle notebook wrapper
+model/
+  config.py          ← shared hyperparameters
+  embedding.py       ← shared embedding (A and B each instantiate their own)
+  encoder.py         ← shared encoder (A: attn_mask=None, B: causal triu mask)
+  heads.py           ← A: PretrainHead/MortalityHead/LOSHead/ForecastHead/ProxyHead
+                       B: NextEventHead
+  model.py           ← BRANCH A:  ICUFoundationModel
+  autoregressive.py  ← BRANCH B:  ICUAutoregressiveModel
+
+training/
+  pretrain.py        ← BRANCH A pretraining  (MEM + VICReg + proxy)
+  finetune.py        ← BRANCH A fine-tuning  (mortality + LOS + vitals)
+  utils.py           ← BRANCH A helpers      (masking, augmentation, VICReg loss)
+  pretrain_ar.py     ← BRANCH B pretraining  (next-event causal LM)
+
+inference/
+  rollout.py         ← BRANCH B only  (rollout + zero-shot query helpers)
+
+evaluation/
+  eval_ar.py         ← BRANCH B eval (also loads Branch A for comparison)
 ```
 
 ---
