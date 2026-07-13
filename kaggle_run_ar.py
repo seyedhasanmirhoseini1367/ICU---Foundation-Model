@@ -64,12 +64,22 @@ if not _SKIP_INIT:
     # ==========================================================================
     os.environ["WANDB_START_METHOD"] = "thread"
     _key = os.environ.get("WANDB_API_KEY", "").strip()
+
+    # Primary: read from wandb-config dataset (seyedhasanmirhoseini/wandb-config)
+    if not _key:
+        _key_file = Path("/kaggle/input/wandb-config/key.txt")
+        if _key_file.exists():
+            _key = _key_file.read_text().strip()
+            print("wandb   : key loaded from wandb-config dataset")
+
+    # Fallback: Kaggle Secrets
     if not _key:
         try:
             from kaggle_secrets import UserSecretsClient
             _key = UserSecretsClient().get_secret("WANDB_API_KEY")
         except Exception as _e:
             print(f"wandb   : UserSecretsClient failed ({_e})")
+
     if _key:
         os.environ["WANDB_API_KEY"] = _key
         os.environ["USE_WANDB"]     = "1"
