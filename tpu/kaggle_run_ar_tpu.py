@@ -88,27 +88,32 @@ STAYS_ZIP_NAME = "extracted_stays.zip"
 
 STAYS_DIR.mkdir(parents=True, exist_ok=True)
 
-_ZIP_PATH = PRE_EXTRACTED / STAYS_ZIP_NAME if (PRE_EXTRACTED / STAYS_ZIP_NAME).exists() else None
+if (PRE_EXTRACTED / STAYS_ZIP_NAME).exists():
+    # Zip file present — extract it
+    print("Pre-extracted stays (zip) found — unzipping ...")
+    with _zipfile.ZipFile(PRE_EXTRACTED / STAYS_ZIP_NAME) as zf:
+        for member in zf.namelist():
+            if member.startswith("stays/"):
+                fname = Path(member).name
+                with zf.open(member) as src, open(STAYS_DIR / fname, "wb") as dst:
+                    _shutil.copyfileobj(src, dst)
+            elif member == "index.csv":
+                with zf.open(member) as src, open(INDEX_PATH, "wb") as dst:
+                    _shutil.copyfileobj(src, dst)
+    print(f"Loaded {len(list(STAYS_DIR.glob('*.csv'))):,} stays OK")
 
-if _ZIP_PATH is None:
+elif (PRE_EXTRACTED / "stays").is_dir():
+    # Kaggle auto-extracted the zip into individual CSVs — use them directly
+    print("Pre-extracted stays (individual CSVs) found — using directly ...")
+    STAYS_DIR  = PRE_EXTRACTED / "stays"
+    INDEX_PATH = PRE_EXTRACTED / "index.csv"
+    print(f"Loaded {len(list(STAYS_DIR.glob('*.csv'))):,} stays OK")
+
+else:
     raise RuntimeError(
         "seyedhasanmirhoseini/mimic-iv-icu-stays not found.\n"
-        "Attach it via Notebook → Add Data before running on TPU.\n"
-        "(Slow extraction is disabled in the TPU runner — TPU time is limited.)"
+        "Attach it via Notebook → Add Data before running on TPU."
     )
-
-print(f"Pre-extracted stays found — unzipping ...")
-with _zipfile.ZipFile(_ZIP_PATH) as zf:
-    for member in zf.namelist():
-        if member.startswith("stays/"):
-            fname = Path(member).name
-            with zf.open(member) as src, open(STAYS_DIR / fname, "wb") as dst:
-                _shutil.copyfileobj(src, dst)
-        elif member == "index.csv":
-            with zf.open(member) as src, open(INDEX_PATH, "wb") as dst:
-                _shutil.copyfileobj(src, dst)
-
-print(f"Loaded {len(list(STAYS_DIR.glob('*.csv'))):,} stays OK")
 
 # ── CELL 5 — Build vocabulary ─────────────────────────────────────────────────
 

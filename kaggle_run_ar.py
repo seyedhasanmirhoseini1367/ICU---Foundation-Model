@@ -133,8 +133,7 @@ _ZIP_PATH = (
 STAYS_DIR.mkdir(parents=True, exist_ok=True)
 
 if _ZIP_PATH is not None:
-    # ── Fast path: unzip pre-extracted stays (~5 min) ────────────────────────
-    # Raw MIMIC dataset does NOT need to be attached.
+    # ── Fast path A: unzip pre-extracted stays ────────────────────────────────
     print(f"Pre-extracted stays found at {_ZIP_PATH} — unzipping ...")
     with _zipfile.ZipFile(_ZIP_PATH) as zf:
         for member in zf.namelist():
@@ -145,6 +144,13 @@ if _ZIP_PATH is not None:
             elif member == "index.csv":
                 with zf.open(member) as src, open(INDEX_PATH, "wb") as dst:
                     _shutil.copyfileobj(src, dst)
+    print(f"Loaded {len(list(STAYS_DIR.glob('*.csv'))):,} pre-extracted stays OK")
+
+elif (PRE_EXTRACTED / "stays").is_dir():
+    # ── Fast path B: Kaggle auto-extracted the zip into individual CSVs ───────
+    print("Pre-extracted stays (individual CSVs) found — using directly ...")
+    STAYS_DIR  = PRE_EXTRACTED / "stays"
+    INDEX_PATH = PRE_EXTRACTED / "index.csv"
     print(f"Loaded {len(list(STAYS_DIR.glob('*.csv'))):,} pre-extracted stays OK")
 
 else:
