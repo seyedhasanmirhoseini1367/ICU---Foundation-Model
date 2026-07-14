@@ -110,9 +110,11 @@ elif (PRE_EXTRACTED / "stays").is_dir():
     print(f"Loaded {len(list(STAYS_DIR.glob('*.csv'))):,} stays OK")
 
 else:
+    _available = [p.name for p in Path("/kaggle/input").iterdir()] if Path("/kaggle/input").exists() else []
     raise RuntimeError(
-        "seyedhasanmirhoseini/mimic-iv-icu-stays not found.\n"
-        "Attach it via Notebook → Add Data before running on TPU."
+        f"seyedhasanmirhoseini/mimic-iv-icu-stays not found.\n"
+        f"Attach it via Notebook -> Add Data before running on TPU.\n"
+        f"Datasets currently mounted: {_available}"
     )
 
 # ── CELL 5 — Build vocabulary ─────────────────────────────────────────────────
