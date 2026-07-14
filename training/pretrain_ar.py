@@ -295,7 +295,6 @@ def main():
     print(f"ICUAutoregressiveModel: {model.count_parameters():,} parameters")
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     # ── Resume from checkpoint ────────────────────────────────────────────────
     best_val_loss  = float("inf")
@@ -307,13 +306,16 @@ def main():
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
-        start_epoch    = ckpt["epoch"] + 1
-        best_val_loss  = ckpt["val_loss"]
-        # Fast-forward cosine scheduler to the correct position
-        for _ in range(ckpt["epoch"]):
-            scheduler.step()
+        start_epoch   = ckpt["epoch"] + 1
+        best_val_loss = ckpt["val_loss"]
         print(f"Resumed  : epoch {ckpt['epoch']}  val_loss={ckpt['val_loss']:.4f}  "
               f"→ continuing from epoch {start_epoch} to {args.epochs}")
+
+    # last_epoch=start_epoch-2 positions the scheduler correctly without
+    # calling step() in a loop (avoids the step-before-optimizer warning).
+    # For a fresh run: start_epoch=1 → last_epoch=-1 (PyTorch default).
+    # For resume from epoch 10: start_epoch=11 → last_epoch=9.
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, last_epoch=start_epoch - 2)
 
     # ── Training loop ─────────────────────────────────────────────────────────
     for epoch in range(start_epoch, args.epochs + 1):

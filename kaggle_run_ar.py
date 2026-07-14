@@ -52,10 +52,10 @@ if not _SKIP_INIT:
                 print(f"  sm_{cap[0]}{cap[1]} < sm_70: installing P100-compatible PyTorch ...")
                 subprocess.run([
                     sys.executable, "-m", "pip", "install", "-q",
-                    "torch==2.0.1+cu118",
+                    "torch==2.2.0+cu118",
                     "--extra-index-url", "https://download.pytorch.org/whl/cu118",
                 ], check=True)
-                print("  PyTorch 2.0.1+cu118 installed — training will use the P100")
+                print("  PyTorch 2.2.0+cu118 installed — training will use the P100")
         except Exception as _gpu_e:
             print(f"GPU     : check failed ({_gpu_e})")
 
