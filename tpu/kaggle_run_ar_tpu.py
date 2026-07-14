@@ -134,7 +134,7 @@ if _RESUME_DATASET.exists():
         _resume_args = ["--resume", str(_ckpt_path)]
         print(f"Resume   : found {_ckpt_path.name}  (epoch {_start_epoch})")
 
-_total_epochs = _start_epoch + 10
+_total_epochs = max(100, _start_epoch + 10)  # at least 100 epochs total; early stopping decides when to stop
 
 # ── CELL 7 — Branch B AR pretraining (8-core TPU) ────────────────────────────
 # Effective batch = 64 per core × 8 cores = 512
@@ -155,6 +155,7 @@ subprocess.run(
         "--epochs",    str(_total_epochs),
         "--batch",     "64",
         "--lr",        "3e-4",
+        "--patience",  "5",
         "--wandb_project", "MIMIC-IV-ICU-AR-TPU",
     ] + _resume_args,
     env={**os.environ, "PYTHONPATH": str(WORK)},

@@ -240,7 +240,8 @@ def _worker(rank, args):
     train_dl = pl.MpDeviceLoader(train_loader, device)
     val_dl   = pl.MpDeviceLoader(val_loader,   device)
 
-    step_offset = 0
+    step_offset    = 0
+    patience_count = 0
 
     for epoch in range(start_epoch, args.epochs + 1):
         xm.master_print(f"\nEpoch {epoch}/{args.epochs}")
@@ -257,7 +258,8 @@ def _worker(rank, args):
         if use_wandb and WANDB_AVAILABLE and xm.is_master_ordinal():
             wandb.log({"ar/val_loss": val_loss, "epoch": epoch})
 
-        # Save from master core only
+        # Save and early-stopping decision — master core only, result broadcast to all
+        stop_flag = 0.0
         if xm.is_master_ordinal():
             xm.save({
                 "epoch"     : epoch,
@@ -268,12 +270,22 @@ def _worker(rank, args):
             }, out_dir / f"ar_epoch{epoch:03d}.pt")
 
             if val_loss < best_val_loss:
-                best_val_loss = val_loss
+                best_val_loss  = val_loss
+                patience_count = 0
                 xm.save(model.state_dict(), out_dir / "ar_best.pt")
-                xm.master_print(f"  → new best {best_val_loss:.4f}  (saved ar_best.pt)")
+                xm.master_print(f"  -> new best {best_val_loss:.4f}  (saved ar_best.pt)")
+            else:
+                patience_count += 1
+                xm.master_print(f"  patience {patience_count}/{args.patience}")
+                if patience_count >= args.patience:
+                    stop_flag = 1.0
 
-        # All cores sync before next epoch
+        # Broadcast stop flag — all 8 cores must break at the same epoch
+        should_stop = xm.mesh_reduce("early_stop", stop_flag, lambda vals: max(vals))
         xm.rendezvous(f"epoch_{epoch}_done")
+        if should_stop > 0.5:
+            xm.master_print(f"Early stopping after epoch {epoch} (patience={args.patience})")
+            break
 
     if use_wandb and WANDB_AVAILABLE and xm.is_master_ordinal():
         wandb.finish()
@@ -300,6 +312,8 @@ def main():
     parser.add_argument("--max_len",   type=int,   default=512)
     parser.add_argument("--val_frac",  type=float, default=0.1)
     parser.add_argument("--seed",      type=int,   default=42)
+    parser.add_argument("--patience",  type=int,   default=5,
+                        help="Early-stopping patience (epochs without val_loss improvement).")
     parser.add_argument("--wandb_project", default="MIMIC-IV-ICU-AR-TPU")
     parser.add_argument("--resume",    default=None,
                         help="Path to ar_epochXXX.pt. --epochs = total (not additional).")
